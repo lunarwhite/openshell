@@ -464,6 +464,33 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
     instance state (filtered by `user.openshell.sandbox_id`), never from
     any in-memory operation state this process could lose on restart —
     there was never any such state to begin with.
+- **Phase 2, Step 9: expanded unit test coverage for lifecycle, network
+  isolation, and interrupted delete.** `get_sandbox`/`list_sandboxes`/
+  `stop_sandbox`/`delete_sandbox` had no unit tests at all before this —
+  every one of them now has both a "no matching instance" and a
+  "matching instance" case against the stub server, including
+  `list_sandboxes` correctly excluding an unmanaged (unlabeled) LXD
+  instance from the same daemon. `delete_sandbox_propagates_a_genuine_
+  delete_failure_rather_than_swallowing_it` is the "interrupted delete"
+  case the implementation plan calls for: a delete that fails for a real
+  reason (not "already gone") must surface as an error, not be
+  misreported as success or as nothing-to-delete. Network isolation gets
+  one direct assertion (`build_instance_spec_confines_the_nic_to_the_
+  configured_managed_bridge`): the `eth0` NIC device always tracks
+  `config.network_name`, built with two different network names to
+  prove it isn't a hard-coded literal that happens to match every other
+  test's default. Resource-limit and mount-translation coverage were
+  already built out in Steps 5-8's own tests (above) and are not
+  duplicated here. No new coverage was added at the `e2e/rust/` level
+  (the full gateway+CLI-driven suite Docker/Podman/VM use) — no other
+  driver crate has a `tests/e2e.rs` either (confirmed by inspection, not
+  assumed), so "matching the Podman suite" the implementation plan asks
+  for means matching Podman's own inline unit-test breadth, which this
+  now does. Building a real `e2e-lxd` Cargo feature and CI-runnable
+  harness would need a Linux host with a real LXD daemon to ever
+  actually exercise it — infeasible from this development machine, and
+  a bigger, separate undertaking from a documentation-language
+  correction.
 - An `/1.0/events` websocket watcher (`src/watcher.rs`) that subscribes
   before listing (to avoid a race that drops events) and — **important
   correction from an earlier draft of the implementation plan** — does

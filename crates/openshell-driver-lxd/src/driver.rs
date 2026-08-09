@@ -740,6 +740,227 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    fn labeled_instance_json(sandbox_id: &str, sandbox_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": format!("openshell-default-{sandbox_id}"),
+            "status": "Running",
+            "status_code": 103,
+            "config": {
+                "user.openshell.sandbox_id": sandbox_id,
+                "user.openshell.sandbox_name": sandbox_name,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_returns_none_when_no_matching_instance_exists() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "get-sandbox-no-match",
+            vec![StubResponse::sync_success(serde_json::json!([]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        let result = driver
+            .get_sandbox("no-such-sandbox")
+            .await
+            .expect("lookup should not error");
+        assert!(result.is_none());
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_returns_the_matching_sandbox_by_label() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "get-sandbox-match",
+            vec![StubResponse::sync_success(serde_json::json!([
+                labeled_instance_json("abc123", "demo")
+            ]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        let sandbox = driver
+            .get_sandbox("abc123")
+            .await
+            .expect("lookup should not error")
+            .expect("matching sandbox should be found");
+        assert_eq!(sandbox.id, "abc123");
+        assert_eq!(sandbox.name, "demo");
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn list_sandboxes_excludes_instances_without_the_managed_label() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let unrelated_instance = serde_json::json!({
+            "name": "some-other-container",
+            "status": "Running",
+            "status_code": 103,
+            "config": {}
+        });
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "list-sandboxes-mixed",
+            vec![StubResponse::sync_success(serde_json::json!([
+                labeled_instance_json("abc123", "demo"),
+                unrelated_instance,
+            ]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        let sandboxes = driver
+            .list_sandboxes()
+            .await
+            .expect("list should not error");
+        assert_eq!(
+            sandboxes.len(),
+            1,
+            "an LXD instance with no user.openshell.sandbox_id label must not be reported as a managed sandbox: {sandboxes:?}"
+        );
+        assert_eq!(sandboxes[0].id, "abc123");
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_returns_an_error_when_no_matching_instance_exists() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "stop-sandbox-no-match",
+            vec![StubResponse::sync_success(serde_json::json!([]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        let err = driver
+            .stop_sandbox("no-such-sandbox")
+            .await
+            .expect_err("stopping an unknown sandbox should fail, not silently succeed");
+        assert!(err.to_string().contains("not found"));
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_issues_a_stop_state_change_for_the_matching_instance() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, request_log, handle) = spawn_lxd_stub(
+            "stop-sandbox-match",
+            vec![
+                // GET /1.0/instances?recursion=2 -- find the instance.
+                StubResponse::sync_success(serde_json::json!([labeled_instance_json(
+                    "abc123", "demo"
+                )])),
+                // PUT /1.0/instances/<name>/state -- stop.
+                StubResponse::sync_success(serde_json::json!({})),
+            ],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        driver
+            .stop_sandbox("abc123")
+            .await
+            .expect("stop should succeed for a matching instance");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r == "PUT /1.0/instances/openshell-default-abc123/state"),
+            "expected a state-change PUT for the resolved instance name: {requests:?}"
+        );
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_returns_false_when_no_matching_instance_exists() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "delete-sandbox-no-match",
+            vec![StubResponse::sync_success(serde_json::json!([]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        let deleted = driver
+            .delete_sandbox("no-such-sandbox")
+            .await
+            .expect("deleting an already-gone sandbox should not error");
+        assert!(!deleted);
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_propagates_a_genuine_delete_failure_rather_than_swallowing_it() {
+        // The "interrupted delete" case the implementation plan calls for:
+        // a delete that fails for a real reason (not "already gone") must
+        // surface as an error so the gateway's own reconciliation retries
+        // it, rather than this driver silently reporting success (or
+        // silently reporting "nothing to delete") for a sandbox that is
+        // still very much there.
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "delete-sandbox-genuine-failure",
+            vec![
+                // GET /1.0/instances?recursion=2 -- find the instance.
+                StubResponse::sync_success(serde_json::json!([labeled_instance_json(
+                    "abc123", "demo"
+                )])),
+                // PUT .../state (best-effort stop) -- result is intentionally
+                // ignored by delete_sandbox, but the request still happens.
+                StubResponse::sync_success(serde_json::json!({})),
+                // DELETE /1.0/instances/<name> -- a real, non-404 failure.
+                StubResponse::error(500, "boom"),
+            ],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        driver.delete_sandbox("abc123").await.expect_err(
+            "a genuine delete failure must not be reported as success or as 'already gone'",
+        );
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     #[test]
     fn requested_sandbox_image_is_none_without_a_spec() {
         let sandbox = DriverSandbox {

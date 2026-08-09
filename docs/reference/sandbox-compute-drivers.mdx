@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Compute Drivers"
 sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, and Kubernetes sandbox compute drivers."
-keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, Reference"
+description: "Reference for Docker, Podman, MicroVM, LXD, and Kubernetes sandbox compute drivers."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, LXD, Kubernetes, Reference"
 position: 4
 ---
 
@@ -27,17 +27,17 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 compute_drivers = ["docker"]
 ```
 
-Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
+Reserved built-in values are `docker`, `podman`, `kubernetes`, `vm`, and `lxd`.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
-When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM and LXD drivers are never auto-detected; configure them explicitly with `compute_drivers = ["vm"]`/`["lxd"]` or set `OPENSHELL_DRIVERS=vm`/`lxd` in the launch environment. LXD's `lxd`-group membership is host-root-equivalent (LXD has no rootless mode), so selecting it always requires this explicit opt-in — auto-detecting it would mean silently granting host-root-equivalent trust the operator never consciously granted.
 
 Common gateway options:
 
 | Gateway TOML option | Description |
 |---|---|
-| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, `vm`, and `lxd`; custom names require `[openshell.drivers.<name>].socket_path`. |
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
@@ -65,9 +65,12 @@ operator must protect the socket so only the gateway uid can access it.
 Reserved built-in names cannot be selected through unmanaged socket endpoints.
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
-Docker and Podman apply them as runtime limits. Kubernetes applies them as both
-container requests and limits. The VM driver accepts the fields but currently
-ignores them.
+Docker, Podman, and LXD apply them as runtime limits. Kubernetes applies them
+as both container requests and limits. The VM driver accepts the fields but
+currently ignores them. LXD maps them onto `limits.cpu.allowance` (a
+cgroup-CFS-bandwidth quota, not the whole-core-count `limits.cpu` key) and
+`limits.memory`, and rejects `--cpu`/`--memory` requests-side values outright,
+like Docker.
 
 Sandbox create also accepts experimental driver-owned config through
 `--driver-config-json`. The value is a JSON object keyed by driver name. The
@@ -324,6 +327,37 @@ The VM driver creates nftables rules on the host for each sandbox VM's TAP netwo
 
 On hosts with restrictive firewalls (e.g. firewalld), the host firewall may additionally block VM traffic that the driver's rules accept. If VM sandboxes cannot reach the network, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces. See the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md#host-side-nftables-rules) for details.
 
+## LXD Driver
+
+LXD-backed sandboxes run as LXD system containers on the gateway host. Use LXD on Ubuntu hosts that already run LXD and have no Docker, Podman, or Kubernetes available.
+
+The gateway starts the standalone `openshell-driver-lxd` subprocess over a private Unix socket, the same managed-subprocess model the VM driver uses (not full in-process integration like Docker/Podman). The driver talks to the LXD daemon's own API socket to create, start, stop, and delete sandbox instances, and to a managed LXD bridge network that it creates if it doesn't already exist.
+
+**`lxd`-group membership is host-root-equivalent.** LXD has no rootless mode: any user in the `lxd` group can trivially obtain full host root (for example, by mounting the host's root filesystem into a container). Because of this, the LXD driver is never auto-detected — selecting it always requires the explicit configuration below, the same way the VM driver does, so an operator never grants this level of host trust by accident.
+
+**Pinned to a `dir`-backed storage pool and verified only on Ubuntu 26.04 LTS with LXD 6.9 (snap).** This driver delivers the supervisor binary, JWT, TLS material, and driver-config mounts into an unprivileged container without `security.privileged` using read-only, idmap-shifted disk devices (`shift=true`), which do not behave uniformly across every LXD storage driver. Other storage backends, Ubuntu releases, and LXD versions are untested; do not assume they work without verifying independently.
+
+For maintainer-level implementation details, status, and known limitations, refer to the [LXD driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-lxd/README.md).
+
+### Enable the LXD Driver
+
+The LXD driver is opt-in. Enable it by setting `compute_drivers = ["lxd"]` in the gateway TOML file:
+
+```toml
+[openshell.gateway]
+compute_drivers = ["lxd"]
+```
+
+For a launch-time override, set `OPENSHELL_DRIVERS=lxd` in the gateway environment and restart the service.
+
+Configure LXD driver values such as `lxd_socket_path`, `driver_dir`, `supervisor_bin`, `default_image`, `grpc_endpoint`, `network_name`, `network_ipv4_subnet`, `storage_pool`, `guest_tls_*`, `sandbox_pids_limit`, and `enable_bind_mounts` in `[openshell.drivers.lxd]`. See the [Gateway Configuration File](./gateway-config) reference for the full schema. Unlike the VM driver's `127.0.0.1`-based default, `grpc_endpoint` defaults to the managed bridge's own gateway-facing address when unset — an LXD sandbox is a real bridged network namespace, not a loopback-sharing VM guest, so `127.0.0.1` from inside it is the sandbox's own loopback, never the gateway's.
+
+The gateway starts `openshell-driver-lxd` over a private Unix socket and passes its own process ID so the driver can reject unexpected local clients, the same hardening the VM driver uses.
+
+### Driver-Config Mounts
+
+The LXD driver supports one driver-config mount type, `bind` (a host-path bind mount, delivered as a read-only-by-default LXD `disk` device), gated behind `enable_bind_mounts` in `[openshell.drivers.lxd]` (off by default — an operator-trust decision, since the host path is chosen by whoever creates the sandbox). Unlike Docker/Podman, LXD does not support `volume`, `tmpfs`, or `image` driver-config mount types.
+
 ## Kubernetes Driver
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.
@@ -539,6 +573,10 @@ The resolved UID/GID appear in:
 ### VM Driver
 
 The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
+
+### LXD Driver
+
+The LXD driver does not resolve or inject sandbox identity dynamically — the sandbox image must already declare a `sandbox` user and group in `/etc/passwd`/`/etc/group`. The driver neither inspects an OCI image's `USER` declaration the way Docker/Podman do, nor injects a UID/GID into the rootfs the way the VM driver does. A stock base image without a pre-baked `sandbox` user fails sandbox creation with `explicit process user 'sandbox' was not found in the image`; bake the user and group into the image at build time instead.
 
 ### Custom Images
 

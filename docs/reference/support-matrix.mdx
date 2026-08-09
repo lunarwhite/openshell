@@ -45,6 +45,7 @@ The gateway can manage sandboxes through several compute drivers.
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
 | Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
+| LXD | Supported for LXD-backed sandboxes on Ubuntu. Opt-in only; never auto-detected. | Requires LXD and `lxd`-group membership, which is host-root-equivalent. |
 
 ## Software Prerequisites
 
@@ -58,6 +59,7 @@ Install the software for the compute driver you use:
 | Helm | 3.x | Required to install `deploy/helm/openshell`. |
 | kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
 | Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |
+| LXD | 6.9 (snap) | Required for LXD-backed gateways. Verified on Ubuntu 26.04 LTS with a `dir`-backed storage pool; other Ubuntu releases, LXD versions, and storage backends are untested. |
 
 ## Sandbox Runtime Versions
 

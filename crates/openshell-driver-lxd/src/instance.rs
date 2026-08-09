@@ -2071,6 +2071,39 @@ mod tests {
     }
 
     #[test]
+    fn build_instance_spec_confines_the_nic_to_the_configured_managed_bridge() {
+        // Network-isolation coverage: every sandbox's NIC device must be
+        // attached to *this driver's own* managed bridge
+        // (config.network_name), never a hard-coded or different network --
+        // otherwise a misconfiguration could put a sandbox on a bridge
+        // shared with something other than other OpenShell-managed
+        // sandboxes. Built with two different network_name values to prove
+        // the device tracks the config, rather than a literal that happens
+        // to match the default in every other test in this file.
+        for network_name in ["openshell", "a-different-managed-bridge"] {
+            let sandbox = test_sandbox();
+            let config = crate::config::LxdComputeConfig {
+                default_image: "openshell-sandbox-base".to_string(),
+                supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+                network_name: network_name.to_string(),
+                ..crate::config::LxdComputeConfig::default()
+            };
+            let spec = build_instance_spec(
+                &sandbox,
+                &config,
+                "http://10.88.77.1:8443",
+                &config.default_image,
+                &[],
+            )
+            .expect("spec builds");
+
+            assert_eq!(spec["devices"][DEVICE_ETH0]["type"], "nic");
+            assert_eq!(spec["devices"][DEVICE_ETH0]["nictype"], "bridged");
+            assert_eq!(spec["devices"][DEVICE_ETH0]["parent"], network_name);
+        }
+    }
+
+    #[test]
     fn driver_condition_maps_running_to_ready_true() {
         let condition = driver_condition_from_status_code(103, "Running");
         assert_eq!(condition.r#type, "Ready");
