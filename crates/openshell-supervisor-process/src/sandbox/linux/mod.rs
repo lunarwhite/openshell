@@ -6,6 +6,8 @@
 mod landlock;
 mod seccomp;
 
+pub use landlock::LandlockAvailability;
+
 use miette::Result;
 use openshell_core::policy::SandboxPolicy;
 use std::path::PathBuf;
@@ -60,6 +62,19 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
 pub fn apply_supervisor_prelude() -> Result<()> {
     seccomp::apply_supervisor_prelude()
+}
+
+/// Probe Landlock availability directly, for CLI-facing diagnostics.
+///
+/// Thin public wrapper around the private `landlock` submodule's own probe
+/// — `landlock` itself stays private (nothing outside this module needs
+/// its ruleset-building internals), but the probe result specifically
+/// needs to be reachable from `openshell-sandbox`'s `--landlock-probe`
+/// flag. See [`crate::sandbox::probe_landlock`] for the cross-platform
+/// (Linux/non-Linux) entry point callers outside this crate should use
+/// instead of this Linux-only one directly.
+pub fn probe_landlock() -> LandlockAvailability {
+    landlock::probe_availability()
 }
 
 /// Legacy single-phase apply. Kept for backward compatibility.

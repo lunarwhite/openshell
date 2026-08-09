@@ -170,6 +170,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_INFERENCE_ROUTES")]
     inference_routes: Option<String>,
 
+    /// Probe Landlock availability and print the result, then exit.
+    ///
+    /// Does not start the supervisor. Intended for external confinement
+    /// verification (e.g. `crates/openshell-driver-lxd/hack/confinement-spike.sh`)
+    /// that needs to know whether Landlock actually works under a given
+    /// container/VM configuration, not just whether the binary can run.
+    /// Exit code 0 means Landlock is available; non-zero (1) means it is
+    /// not (see the printed message for why: not implemented, not enabled,
+    /// blocked, or unsupported platform).
+    #[arg(long)]
+    landlock_probe: bool,
+
     /// Enable health check endpoint.
     #[arg(long)]
     health_check: bool,
@@ -529,6 +541,12 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+
+    if args.landlock_probe {
+        let (available, message) = openshell_supervisor_process::sandbox::probe_landlock();
+        println!("{message}");
+        std::process::exit(i32::from(!available));
+    }
 
     if args.mode.network_init {
         let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);

@@ -42,6 +42,34 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     }
 }
 
+/// Probe Landlock availability for CLI-facing diagnostics (e.g.
+/// `openshell-sandbox --landlock-probe`), regardless of target platform.
+///
+/// Returns `(available, message)`. `available` is `true` only on Linux
+/// when the kernel reports [`linux::LandlockAvailability::Available`];
+/// `message` is a human-readable description safe to print directly.
+/// Closes a real, previously-documented gap: earlier tooling
+/// (`crates/openshell-driver-lxd/hack/confinement-spike.sh`) wanted to call
+/// a `--landlock-probe` flag on the real supervisor binary that did not
+/// exist, and silently treated that as a pass via an always-succeeding
+/// fallback command instead. This function is what that flag now calls.
+pub fn probe_landlock() -> (bool, String) {
+    #[cfg(target_os = "linux")]
+    {
+        let availability = linux::probe_landlock();
+        let available = matches!(availability, linux::LandlockAvailability::Available { .. });
+        (available, availability.to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        (
+            false,
+            "Landlock is Linux-only; not supported on this platform".to_string(),
+        )
+    }
+}
+
 /// Apply seccomp hardening for the long-lived supervisor process itself.
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 pub fn apply_supervisor_startup_hardening() -> Result<()> {
