@@ -65,7 +65,9 @@ use libc::SYS_kexec_file_load;
 pub fn apply_supervisor_prelude() -> Result<()> {
     let filter = build_supervisor_prelude_filter()?;
     set_no_new_privs()?;
-    apply_filter_all_threads(&filter).into_diagnostic()?;
+    apply_filter_all_threads(&filter).map_err(|err| {
+        miette::miette!("failed to install the supervisor prelude seccomp filter (TSYNC): {err}")
+    })?;
     Ok(())
 }
 
@@ -176,8 +178,10 @@ fn apply_runtime_filters(
     main_filter: seccompiler::BpfProgramRef<'_>,
     clone3_filter: seccompiler::BpfProgramRef<'_>,
 ) -> Result<()> {
-    apply_filter(clone3_filter).into_diagnostic()?;
-    apply_filter(main_filter).into_diagnostic()?;
+    apply_filter(clone3_filter)
+        .map_err(|err| miette::miette!("failed to install the clone3 seccomp filter: {err}"))?;
+    apply_filter(main_filter)
+        .map_err(|err| miette::miette!("failed to install the main seccomp filter: {err}"))?;
     Ok(())
 }
 

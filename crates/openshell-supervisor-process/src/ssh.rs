@@ -1282,7 +1282,12 @@ mod unsafe_pty {
             #[allow(unsafe_code)]
             let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
             if result != 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                crate::process::write_pre_exec_diagnostic(&format!(
+                    "setns(CLONE_NEWNET, fd={fd}) failed entering the sandbox network \
+                     namespace: {err}"
+                ));
+                return Err(err);
             }
         }
 
@@ -1291,24 +1296,43 @@ mod unsafe_pty {
 
         #[cfg(target_os = "linux")]
         if let Some(mount) = supervisor_identity_mount {
-            mount.enter_for_child()?;
+            if let Err(err) = mount.enter_for_child() {
+                crate::process::write_pre_exec_diagnostic(&format!(
+                    "failed to enter the supervisor identity mount namespace: {err}"
+                ));
+                return Err(err);
+            }
         }
 
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
         if enforcement_mode.uses_privileged_process_setup() {
-            drop_privileges_with_identity(policy, resolved_identity)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            if let Err(err) = drop_privileges_with_identity(policy, resolved_identity) {
+                #[cfg(target_os = "linux")]
+                crate::process::write_pre_exec_diagnostic(&format!(
+                    "drop_privileges_with_identity failed: {err}"
+                ));
+                return Err(std::io::Error::other(err.to_string()));
+            }
         }
-        crate::process::harden_child_process()
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        if let Err(err) = crate::process::harden_child_process() {
+            #[cfg(target_os = "linux")]
+            crate::process::write_pre_exec_diagnostic(&format!(
+                "harden_child_process failed: {err}"
+            ));
+            return Err(std::io::Error::other(err.to_string()));
+        }
 
         // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
         // restrict_self() does not require root.
         #[cfg(target_os = "linux")]
         if let Some(prepared) = prepared {
-            crate::sandbox::linux::enforce(prepared)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            if let Err(err) = crate::sandbox::linux::enforce(prepared) {
+                crate::process::write_pre_exec_diagnostic(&format!(
+                    "sandbox::linux::enforce (Landlock restrict_self + seccomp) failed: {err}"
+                ));
+                return Err(std::io::Error::other(err.to_string()));
+            }
         }
 
         #[cfg(not(target_os = "linux"))]

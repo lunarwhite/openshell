@@ -122,6 +122,33 @@ impl ProcessEnforcementMode {
     }
 }
 
+/// Write a diagnostic line directly to fd 2, bypassing `pre_exec`'s
+/// error-return channel back to the parent.
+///
+/// `Command::pre_exec`'s closure can only communicate failure to the
+/// parent process (across the fork boundary, via a pipe) as a raw OS
+/// errno. An error constructed without one — anything built through
+/// `io::Error::other(...)` or a wrapped miette message, which is most of
+/// what this module's `pre_exec` closures return — has no `raw_os_error()`
+/// to send, so libstd's own child-side fork/exec machinery substitutes a
+/// generic `EINVAL` sentinel instead of transmitting the message. That
+/// silently discarded whatever context we added here, no matter how
+/// descriptive — confirmed by wrapping successive candidate failures with
+/// real messages and seeing the exact same bare `Invalid argument (os
+/// error 22)` on the parent side regardless. Writing straight to fd 2 (a
+/// raw, async-signal-safe syscall, safe in a `pre_exec` context) sidesteps
+/// that channel entirely: this process's stderr is already redirected to
+/// a real file by the sandbox's own entrypoint script by the time any
+/// child is spawned, so the line actually lands somewhere readable.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_pre_exec_diagnostic(msg: &str) {
+    let line = format!("pre_exec: {msg}\n");
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
@@ -728,32 +755,58 @@ impl ProcessHandle {
                     if let Some(fd) = netns_fd {
                         let result = libc::setns(fd, libc::CLONE_NEWNET);
                         if result != 0 {
-                            return Err(std::io::Error::last_os_error());
+                            let err = std::io::Error::last_os_error();
+                            #[cfg(target_os = "linux")]
+                            write_pre_exec_diagnostic(&format!(
+                                "setns(CLONE_NEWNET, fd={fd}) failed entering the sandbox \
+                                 network namespace: {err}"
+                            ));
+                            return Err(err);
                         }
                     }
 
                     #[cfg(target_os = "linux")]
                     if let Some(mount) = supervisor_identity_mount {
-                        mount.enter_for_child()?;
+                        if let Err(err) = mount.enter_for_child() {
+                            write_pre_exec_diagnostic(&format!(
+                                "failed to enter the supervisor identity mount namespace: {err}"
+                            ));
+                            return Err(err);
+                        }
                     }
 
                     // Drop privileges. initgroups/setgid/setuid need access to
                     // /etc/group and /etc/passwd which would be blocked if
                     // Landlock were already enforced.
                     if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges_with_identity(&policy, resolved_identity)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        if let Err(err) = drop_privileges_with_identity(&policy, resolved_identity)
+                        {
+                            #[cfg(target_os = "linux")]
+                            write_pre_exec_diagnostic(&format!(
+                                "drop_privileges_with_identity failed: {err}"
+                            ));
+                            return Err(std::io::Error::other(err.to_string()));
+                        }
                     }
 
-                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if let Err(err) = harden_child_process() {
+                        #[cfg(target_os = "linux")]
+                        write_pre_exec_diagnostic(&format!("harden_child_process failed: {err}"));
+                        return Err(std::io::Error::other(err.to_string()));
+                    }
 
                     // Phase 2 (as unprivileged user): Enforce the prepared
                     // Landlock ruleset via restrict_self() + apply seccomp.
                     // restrict_self() does not require root.
                     #[cfg(target_os = "linux")]
                     if let Some(prepared) = prepared_sandbox.take() {
-                        sandbox::linux::enforce(prepared)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        if let Err(err) = sandbox::linux::enforce(prepared) {
+                            write_pre_exec_diagnostic(&format!(
+                                "sandbox::linux::enforce (Landlock restrict_self + seccomp) \
+                                 failed: {err}"
+                            ));
+                            return Err(std::io::Error::other(err.to_string()));
+                        }
                     }
 
                     Ok(())
