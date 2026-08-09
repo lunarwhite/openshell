@@ -139,6 +139,19 @@ pub struct LxdComputeConfig {
     /// Unix socket path inside the sandbox the supervisor's SSH relay
     /// uses.
     pub sandbox_ssh_socket_path: String,
+
+    /// Host-side CA certificate for the guest's mTLS client bundle.
+    pub guest_tls_ca: Option<PathBuf>,
+    /// Host-side client certificate for the guest's mTLS client bundle.
+    pub guest_tls_cert: Option<PathBuf>,
+    /// Host-side private key for the guest's mTLS client bundle.
+    pub guest_tls_key: Option<PathBuf>,
+    /// Max concurrent processes/threads allowed inside a sandbox
+    /// instance. `0` inherits the LXD driver's own default.
+    pub sandbox_pids_limit: i64,
+    /// Whether a sandbox's `driver_config.mounts` may request a
+    /// host-path bind mount. Off by default.
+    pub enable_bind_mounts: bool,
 }
 
 impl LxdComputeConfig {
@@ -165,8 +178,74 @@ impl Default for LxdComputeConfig {
             network_ipv4_subnet: DEFAULT_NETWORK_IPV4_SUBNET.to_string(),
             storage_pool: DEFAULT_STORAGE_POOL.to_string(),
             sandbox_ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            guest_tls_ca: None,
+            guest_tls_cert: None,
+            guest_tls_key: None,
+            sandbox_pids_limit: openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT,
+            enable_bind_mounts: false,
         }
     }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LxdGuestTlsPaths {
+    pub ca: PathBuf,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+/// Resolve and validate the guest mTLS material for the LXD driver,
+/// mirroring [`super::vm::compute_driver_guest_tls_paths`] exactly: only
+/// required (and only checked for "all three or none") when
+/// `grpc_endpoint` uses `https://`. A plaintext `grpc_endpoint` makes any
+/// configured TLS paths moot, so this returns `Ok(None)` without even
+/// looking at them.
+#[cfg(unix)]
+pub fn compute_driver_guest_tls_paths(
+    lxd_config: &LxdComputeConfig,
+) -> Result<Option<LxdGuestTlsPaths>> {
+    if !lxd_config.grpc_endpoint.starts_with("https://") {
+        return Ok(None);
+    }
+
+    let provided = [
+        lxd_config.guest_tls_ca.as_ref(),
+        lxd_config.guest_tls_cert.as_ref(),
+        lxd_config.guest_tls_key.as_ref(),
+    ];
+    if provided.iter().all(Option::is_none) {
+        return Err(Error::config(
+            "lxd compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
+        ));
+    }
+
+    let Some(ca) = lxd_config.guest_tls_ca.clone() else {
+        return Err(Error::config(
+            "guest_tls_ca is required when LXD guest TLS materials are configured",
+        ));
+    };
+    let Some(cert) = lxd_config.guest_tls_cert.clone() else {
+        return Err(Error::config(
+            "guest_tls_cert is required when LXD guest TLS materials are configured",
+        ));
+    };
+    let Some(key) = lxd_config.guest_tls_key.clone() else {
+        return Err(Error::config(
+            "guest_tls_key is required when LXD guest TLS materials are configured",
+        ));
+    };
+
+    for path in [&ca, &cert, &key] {
+        if !path.is_file() {
+            return Err(Error::config(format!(
+                "lxd guest TLS material '{}' does not exist or is not a file",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(Some(LxdGuestTlsPaths { ca, cert, key }))
 }
 
 /// Resolve the `openshell-driver-lxd` binary path. See
@@ -228,6 +307,7 @@ pub async fn spawn(
     let driver_bin = resolve_compute_driver_bin(lxd_config)?;
     let supervisor_bin = resolve_supervisor_bin(lxd_config)?;
     let socket_path = compute_driver_socket_path(lxd_config);
+    let guest_tls_paths = compute_driver_guest_tls_paths(lxd_config)?;
     prepare_managed_driver_socket_path(&lxd_config.state_dir, &socket_path, "lxd")?;
 
     let mut command = Command::new(&driver_bin);
@@ -258,6 +338,17 @@ pub async fn spawn(
         command
             .arg("--sandbox-ssh-socket-path")
             .arg(&lxd_config.sandbox_ssh_socket_path);
+    }
+    if let Some(tls) = guest_tls_paths {
+        command.arg("--lxd-tls-ca").arg(tls.ca);
+        command.arg("--lxd-tls-cert").arg(tls.cert);
+        command.arg("--lxd-tls-key").arg(tls.key);
+    }
+    command
+        .arg("--lxd-pids-limit")
+        .arg(lxd_config.sandbox_pids_limit.to_string());
+    if lxd_config.enable_bind_mounts {
+        command.arg("--lxd-enable-bind-mounts");
     }
 
     let mut child = command.spawn().map_err(|e| {

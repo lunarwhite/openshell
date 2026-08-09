@@ -19,7 +19,11 @@
 > supervisor-, and image-pipeline-level bugs found and fixed only by
 > this real-daemon testing (none of which any unit test caught) — and
 > "What the Stage 2 pass does NOT prove" for the caveats before treating
-> this as production-ready.
+> this as production-ready. **Also implemented since (Phase 2, Steps
+> 5-8): guest mTLS, resource limits, driver-config bind mounts, and
+> rollback/reconciliation hardening — unit-test-verified only, not yet
+> exercised against a real daemon.** See "What's actually implemented"
+> below for both.
 
 LXD compute driver for OpenShell — Phase 1 scope: LXD/LXC on Ubuntu,
 container-type instances only, run as an unmanaged extension driver (zero
@@ -403,6 +407,63 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   cache-miss conversion (224s) and a cache-hit resolution of the
   identical digest right after (9s — roughly 25x faster, direct,
   measured evidence the whole point of the digest-cache design holds).
+- **Phase 2, Steps 5-8: mTLS, resource limits, driver-config mounts,
+  rollback/reconciliation hardening.** Unit-test-verified only — unlike
+  every item above, none of this has been exercised against a real LXD
+  daemon yet (no `run-stage2-oci.sh`/`run-managed-driver.sh` re-run with
+  these features enabled). Treat this bullet's claims as "the code path
+  exists and its unit tests pass," not "proven against a real daemon,"
+  until a real run says otherwise — every *other* claim in this file
+  earned that distinction from a real Stage 2 failure it caused and then
+  fixed; these four have not yet had that chance to be wrong.
+  - **mTLS** (`config.rs`'s `guest_tls_ca`/`guest_tls_cert`/
+    `guest_tls_key`, validated "all three or none" by `validate_tls_config`):
+    delivered via the same read-only `shift=true` disk-device mechanism
+    as the supervisor binary and JWT (three more devices in
+    `build_instance_spec`), to the same fixed guest paths and env vars
+    (`OPENSHELL_TLS_CA`/`_CERT`/`_KEY`) Docker/Podman/VM already use, so
+    the supervisor's own TLS-loading code needs no driver-specific
+    branch. The gateway side (`compute::lxd::compute_driver_guest_tls_paths`)
+    mirrors the VM driver's own gate exactly: only required, and only
+    validated for completeness, when `grpc_endpoint` is `https://`.
+  - **Resource limits** (`instance::lxd_resource_limits`): `template.
+    resources.cpu_limit`/`memory_limit` map onto `limits.cpu.allowance`
+    (a `"<quota>ms/100ms"` cgroup-CFS-bandwidth string, *not* bare
+    `limits.cpu` — see `LxdResourceLimits::cpu_allowance`'s doc comment
+    for why a whole-core-count/CPU-set pinning primitive would have been
+    the wrong mapping) and `limits.memory` (an exact byte count with
+    LXD's `B` suffix). `cpu_request`/`memory_request` are rejected, not
+    silently ignored — LXD, like Docker, has no reservation primitive
+    distinct from its limit. `sandbox_pids_limit` (driver config, not a
+    sandbox request) maps onto `limits.processes`, `0` inheriting LXD's
+    own unlimited default rather than meaning "zero processes allowed" —
+    the same convention Docker/Podman already use.
+  - **Driver-config mounts** (`instance::LxdDriverMountConfig`): `bind`
+    only, deliberately — see that enum's own doc comment for why
+    `volume`/`tmpfs`/`image` (which Docker/Podman's own mount-config
+    enums support) were scoped out rather than half-built. Reuses
+    `openshell_core::driver_mounts` wholesale for source/target
+    validation (absolute host paths, no reserved-path collisions, no
+    duplicate targets) rather than reimplementing any of it, gated
+    behind the same `enable_bind_mounts` operator opt-in Docker/Podman
+    already require.
+  - **Rollback/reconciliation**: every async LXD call this driver makes
+    already polled its own operation to completion before Steps 5-8
+    (`LxdClient::send_and_resolve`) — nothing to add there. The actual
+    gap: a failed `create_instance` (or a `build_instance_spec` failure,
+    e.g. an invalid mount) left the entrypoint script and JWT files
+    already written to the host filesystem orphaned, since nothing had
+    a reason to clean them up before this driver ever created an
+    instance to roll back. Fixed by `cleanup_sandbox_delivery_files`,
+    called on every `create_sandbox` failure path from that point
+    onward — deliberately *not* touching `image::ensure_lxd_image`'s own
+    "leave the staging directory for diagnosis on failure" directory,
+    which shares the same per-sandbox parent. Restart-time reconciliation
+    needed no new code at all: `get_sandbox`/`list_sandboxes` already
+    always re-derive a sandbox's identity and status from LXD's *current*
+    instance state (filtered by `user.openshell.sandbox_id`), never from
+    any in-memory operation state this process could lose on restart —
+    there was never any such state to begin with.
 - An `/1.0/events` websocket watcher (`src/watcher.rs`) that subscribes
   before listing (to avoid a race that drops events) and — **important
   correction from an earlier draft of the implementation plan** — does
@@ -436,9 +497,11 @@ Read this before treating the `pass` outcome above as more than "the
 happy path works end to end" — see `run-stage2.sh`'s own header comment
 for the authoritative list, summarized here:
 
-- **No TLS/mTLS.** The run uses `--disable-tls` throughout; this driver
-  has no mechanism yet to deliver client mTLS material into a sandbox
-  (an explicit Phase 2 item).
+- **No TLS/mTLS.** The run uses `--disable-tls` throughout. A delivery
+  mechanism now exists (Phase 2, Step 5 — see "What's actually
+  implemented" below), but `run-stage2.sh`/`run-stage2-oci.sh` have not
+  been re-run with it enabled, so it remains unverified against a real
+  daemon.
 - **Bypasses `_gateway.lxd`/`GetGatewayListenerRequirements` entirely**
   by passing the driver's own bridge gateway IP directly as
   `grpc_endpoint`. That code path in `driver.rs` remains unexercised.
@@ -459,8 +522,6 @@ for the authoritative list, summarized here:
   (`umoci unpack` + `lxc image import`); every sandbox uses that same
   image. The OCI-to-LXD conversion pipeline is Phase 2's largest single
   workstream — see the design doc.
-- Resource limits, driver-config mounts, mTLS callback support — explicit
-  Phase 2 feature-parity items.
 - Auto-detection. This driver is never added to the gateway's
   `detect_driver()` — it's opt-in only, like the VM driver, because LXD has
   no rootless mode and `lxd`-group membership is host-root-equivalent. See

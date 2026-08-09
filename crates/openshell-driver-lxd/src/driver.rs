@@ -3,9 +3,9 @@
 
 //! LXD compute driver.
 //!
-//! Phase 1 scope: LXD container instances on Ubuntu, one pinned sandbox
-//! image, no resource limits or driver-config mounts. See the crate-level
-//! doc comment in `lib.rs` and `README.md` for status.
+//! LXD container instances on Ubuntu; resource limits, guest mTLS, and
+//! driver-config bind mounts are all built (Phase 2, Steps 5-7). See the
+//! crate-level doc comment in `lib.rs` and `README.md` for status.
 
 use crate::client::{LxdApiError, LxdClient};
 use crate::config::LxdComputeConfig;
@@ -50,6 +50,41 @@ fn requested_sandbox_image(sandbox: &DriverSandbox) -> Option<&str> {
         .and_then(|spec| spec.template.as_ref())
         .map(|template| template.image.trim())
         .filter(|image| !image.is_empty())
+}
+
+/// Best-effort removal of the entrypoint script and JWT token this driver
+/// writes to the host filesystem before `create_instance`, used on any
+/// `create_sandbox` failure from that point onward.
+///
+/// Deliberately leaves `instance::image_staging_dir`'s directory alone --
+/// see `create_sandbox`'s own doc comment for why. Both paths share a
+/// parent directory (`entrypoint_script_host_path`/
+/// `sandbox_token_host_path`'s doc comments), so this removes the two
+/// specific files rather than the whole per-sandbox directory, which
+/// would otherwise also delete that separately-preserved staging content.
+async fn cleanup_sandbox_delivery_files(sandbox_id: &str) {
+    if let Ok(path) = instance::entrypoint_script_host_path(sandbox_id)
+        && let Err(err) = tokio::fs::remove_file(&path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to clean up entrypoint script after a failed sandbox create"
+        );
+    }
+    if let Ok(path) = instance::sandbox_token_host_path(sandbox_id)
+        && let Err(err) = tokio::fs::remove_file(&path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to clean up JWT token file after a failed sandbox create"
+        );
+    }
 }
 
 /// LXD compute driver managing sandbox instances via the LXD REST API.
@@ -217,7 +252,19 @@ impl LxdComputeDriver {
     /// operations to complete (create, then start) before returning.
     ///
     /// Rollback on failure mirrors the Podman driver's discipline: any
-    /// partially-created instance is removed before returning the error.
+    /// partially-created instance is removed, and any host-side delivery
+    /// files already written (entrypoint script, JWT) are cleaned up,
+    /// before returning the error. Every LXD API call this function makes
+    /// (`create_instance`, `set_instance_state`, `delete_instance`) already
+    /// polls its own async operation to completion inside
+    /// [`crate::client::LxdClient::send_and_resolve`] before returning --
+    /// there is no separate "poll to completion" step to add here.
+    ///
+    /// Deliberately does *not* remove `instance::image_staging_dir`'s
+    /// directory on failure -- that's `crate::image::ensure_lxd_image`'s
+    /// own, separately documented "leave in place for diagnosis on
+    /// failure" decision, which this function's own rollback must not
+    /// silently override.
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
         let name = instance::instance_name(sandbox)?;
 
@@ -302,18 +349,30 @@ impl LxdComputeDriver {
             }
         }
 
-        let spec = instance::build_instance_spec(
+        let spec = match instance::build_instance_spec(
             sandbox,
             &self.config,
             &self.config.grpc_endpoint,
             &image_alias,
             &image_env,
-        )?;
+        ) {
+            Ok(spec) => spec,
+            Err(err) => {
+                cleanup_sandbox_delivery_files(&sandbox.id).await;
+                return Err(err);
+            }
+        };
 
-        self.client.create_instance(&spec).await.map_err(|err| {
-            let mapped: ComputeDriverError = err.into();
-            mapped
-        })?;
+        if let Err(err) = self.client.create_instance(&spec).await {
+            // The instance either never got created or LXD itself rolled
+            // back an internally-failed create -- either way, nothing
+            // this driver created (on LXD's side) survives a failed
+            // create_instance to delete. The host-side delivery files
+            // are a different story: they were already written before
+            // this call and nothing else will ever clean them up.
+            cleanup_sandbox_delivery_files(&sandbox.id).await;
+            return Err(err.into());
+        }
 
         if let Err(err) = self
             .client
@@ -323,6 +382,7 @@ impl LxdComputeDriver {
             // Roll back the just-created instance so a failed start doesn't
             // leave an orphaned, never-started sandbox behind.
             let _ = self.client.delete_instance(&name).await;
+            cleanup_sandbox_delivery_files(&sandbox.id).await;
             return Err(err.into());
         }
 
@@ -364,6 +424,24 @@ impl LxdComputeDriver {
         Ok(deleted)
     }
 
+    /// Restart-time reconciliation (Phase 2, Step 8) falls out of this
+    /// function's — and [`Self::list_sandboxes`]'s — own shape rather
+    /// than needing a dedicated reconcile routine: both always re-derive
+    /// a sandbox's identity and status from LXD's *current* instance
+    /// state, filtered by the `user.openshell.sandbox_id` config key this
+    /// driver stamps at create time
+    /// ([`SANDBOX_ID_CONFIG_KEY`]/[`instance::build_instance_spec`]),
+    /// never from any in-memory operation/pending state this process
+    /// might have held. There is no such state to lose on a driver
+    /// restart in the first place — every async LXD call this driver
+    /// makes already blocks until its own operation resolves (see
+    /// [`crate::client::LxdClient::create_instance`]'s doc comment)
+    /// before returning, so nothing is ever left "in flight" from this
+    /// process's point of view across a restart. The gateway's own
+    /// generic reconciler (`openshell_server::compute::ComputeRuntime::
+    /// reconcile_store_with_backend`) polls [`Self::list_sandboxes`]
+    /// exactly the same way after *its* restart, so a gateway restart is
+    /// likewise transparent without this driver doing anything special.
     pub async fn get_sandbox(
         &self,
         sandbox_id: &str,
@@ -524,6 +602,142 @@ mod tests {
             requested_sandbox_image(&sandbox),
             Some("ghcr.io/example/sandbox:latest")
         );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_cleans_up_delivery_files_when_create_instance_fails() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let (socket_path, _request_log, handle) = spawn_lxd_stub(
+            "create-sandbox-rollback",
+            vec![
+                // POST /1.0/instances -> error, nothing ever gets created.
+                StubResponse::error(400, "boom"),
+            ],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            ..LxdComputeConfig::default()
+        });
+        let sandbox_id = format!(
+            "test-rollback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+        let sandbox = DriverSandbox {
+            id: sandbox_id.clone(),
+            name: "demo".to_string(),
+            namespace: String::new(),
+            spec: Some(DriverSandboxSpec {
+                sandbox_token: "test-jwt".to_string(),
+                ..Default::default()
+            }),
+            status: None,
+            workspace: "default".to_string(),
+        };
+
+        driver
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("create_instance failure should propagate");
+
+        handle.await.expect("stub task should finish");
+
+        let entrypoint_path = instance::entrypoint_script_host_path(&sandbox_id)
+            .expect("entrypoint path should resolve");
+        let token_path =
+            instance::sandbox_token_host_path(&sandbox_id).expect("token path should resolve");
+        assert!(
+            !entrypoint_path.exists(),
+            "entrypoint script should be cleaned up after a failed create_instance: {}",
+            entrypoint_path.display()
+        );
+        assert!(
+            !token_path.exists(),
+            "JWT token file should be cleaned up after a failed create_instance: {}",
+            token_path.display()
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_cleans_up_delivery_files_when_start_fails() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let (socket_path, request_log, handle) = spawn_lxd_stub(
+            "create-sandbox-start-rollback",
+            vec![
+                // POST /1.0/instances -> sync success (instance created).
+                StubResponse::sync_success(serde_json::json!({})),
+                // PUT /1.0/instances/<name>/state (start) -> error.
+                StubResponse::error(400, "start boom"),
+                // DELETE /1.0/instances/<name> (rollback) -> sync success.
+                StubResponse::sync_success(serde_json::json!({})),
+            ],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            ..LxdComputeConfig::default()
+        });
+        let sandbox_id = format!(
+            "test-start-rollback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        );
+        let sandbox = DriverSandbox {
+            id: sandbox_id.clone(),
+            name: "demo".to_string(),
+            namespace: String::new(),
+            spec: Some(DriverSandboxSpec {
+                sandbox_token: "test-jwt".to_string(),
+                ..Default::default()
+            }),
+            status: None,
+            workspace: "default".to_string(),
+        };
+
+        driver
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("start failure should propagate");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.iter().any(|r| r.starts_with("DELETE ")),
+            "a failed start should roll back the created instance: {requests:?}"
+        );
+
+        let entrypoint_path = instance::entrypoint_script_host_path(&sandbox_id)
+            .expect("entrypoint path should resolve");
+        let token_path =
+            instance::sandbox_token_host_path(&sandbox_id).expect("token path should resolve");
+        assert!(
+            !entrypoint_path.exists(),
+            "entrypoint script should be cleaned up after a failed start: {}",
+            entrypoint_path.display()
+        );
+        assert!(
+            !token_path.exists(),
+            "JWT token file should be cleaned up after a failed start: {}",
+            token_path.display()
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[test]

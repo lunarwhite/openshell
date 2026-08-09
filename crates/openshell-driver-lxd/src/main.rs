@@ -23,7 +23,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_lxd::config::{
     DEFAULT_LXD_SOCKET_PATH, DEFAULT_NETWORK_IPV4_SUBNET, DEFAULT_NETWORK_NAME,
-    DEFAULT_STORAGE_POOL,
+    DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STORAGE_POOL,
 };
 use openshell_driver_lxd::{ComputeDriverService, LxdComputeConfig, LxdComputeDriver};
 
@@ -126,6 +126,37 @@ struct Args {
         default_value = openshell_core::container_paths::SSH_SOCKET_PATH
     )]
     sandbox_ssh_socket_path: String,
+
+    /// Host path to the CA certificate for sandbox guest mTLS.
+    ///
+    /// All three of `--lxd-tls-ca`/`--lxd-tls-cert`/`--lxd-tls-key` must be
+    /// set together, or none at all — see `LxdComputeConfig::
+    /// validate_tls_config`.
+    #[arg(long, env = "OPENSHELL_LXD_TLS_CA")]
+    lxd_tls_ca: Option<PathBuf>,
+
+    /// Host path to the client certificate for sandbox guest mTLS.
+    #[arg(long, env = "OPENSHELL_LXD_TLS_CERT")]
+    lxd_tls_cert: Option<PathBuf>,
+
+    /// Host path to the client private key for sandbox guest mTLS.
+    #[arg(long, env = "OPENSHELL_LXD_TLS_KEY")]
+    lxd_tls_key: Option<PathBuf>,
+
+    /// Max concurrent processes/threads allowed inside a sandbox instance.
+    /// `0` inherits LXD's own default (unlimited).
+    #[arg(
+        long,
+        env = "OPENSHELL_LXD_PIDS_LIMIT",
+        default_value_t = DEFAULT_SANDBOX_PIDS_LIMIT
+    )]
+    lxd_pids_limit: i64,
+
+    /// Allow sandboxes to request host-path bind mounts via
+    /// `driver_config.mounts`. An operator-trust decision, off by
+    /// default.
+    #[arg(long, env = "OPENSHELL_LXD_ENABLE_BIND_MOUNTS")]
+    lxd_enable_bind_mounts: bool,
 }
 
 #[tokio::main]
@@ -147,6 +178,11 @@ async fn main() -> Result<()> {
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         gateway_port: args.gateway_port,
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
+        guest_tls_ca: args.lxd_tls_ca,
+        guest_tls_cert: args.lxd_tls_cert,
+        guest_tls_key: args.lxd_tls_key,
+        sandbox_pids_limit: args.lxd_pids_limit,
+        enable_bind_mounts: args.lxd_enable_bind_mounts,
         ..LxdComputeConfig::default()
     })
     .await

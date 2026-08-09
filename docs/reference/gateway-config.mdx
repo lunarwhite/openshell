@@ -781,11 +781,23 @@ grpc_endpoint          = "http://10.77.99.1:17670"
 network_name           = "openshell"
 network_ipv4_subnet    = "10.77.99.1/24"
 storage_pool           = "default"
+# Guest mTLS client bundle. Set all three or none -- a partial set is
+# rejected at driver startup. Required (and validated) only when
+# grpc_endpoint uses https://.
+guest_tls_ca           = "/var/lib/openshell/guest-tls/ca.pem"
+guest_tls_cert         = "/var/lib/openshell/guest-tls/client.pem"
+guest_tls_key          = "/var/lib/openshell/guest-tls/client-key.pem"
+# Max concurrent processes/threads per sandbox instance, mapped onto
+# LXD's limits.processes. 0 inherits LXD's own unlimited default.
+sandbox_pids_limit     = 2048
+# Allow a sandbox's driver_config.mounts to request a host-path bind
+# mount (LXD disk device). An operator-trust decision; off by default.
+# enable_bind_mounts   = true
 ```
 
 All OpenShell-managed instances share LXD's own `default` project, filtered by the `user.openshell.sandbox_id`/`user.openshell.sandbox_name` labels the driver stamps on every instance it creates — not a dedicated per-tenant LXD project. This matches the Podman driver's shape; there is currently exactly one tenant (this gateway) per LXD daemon.
 
-Guest mTLS (the `guest_tls_*` fields Docker/Podman/VM support) is not yet implemented for this driver — `grpc_endpoint` must be `http://`, not `https://`.
+`template.resources.cpu_limit`/`memory_limit` map onto LXD's `limits.cpu.allowance` (a cgroup CFS-bandwidth quota, not the whole-core-count `limits.cpu` key) and `limits.memory`; `cpu_request`/`memory_request` are rejected outright, since LXD has no reservation primitive distinct from its limit. `enable_bind_mounts` gates whether a sandbox's `driver_config.mounts` may request a host-path bind mount (delivered as an LXD `disk` device).
 
 ### Extension Driver
 

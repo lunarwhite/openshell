@@ -127,49 +127,60 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
     );
 }
 
-/// LXD has no guest-mTLS callback support yet (Phase 2 Step 5, not yet
-/// built), so this doesn't call `apply_guest_tls_defaults_to_split_fields`
-/// the way `apply_vm_runtime_defaults`/`apply_podman_runtime_defaults` do
-/// — add that once `LxdComputeConfig` actually has `guest_tls_*` fields
-/// to fill in.
+/// Sets `grpc_endpoint`'s default (deriving the bridge gateway IP rather
+/// than VM's `127.0.0.1` — see the inline comment below for why) and, as
+/// of Phase 2 Step 5, auto-populates `guest_tls_*` from the gateway's own
+/// local self-signed bundle the same way `apply_vm_runtime_defaults`/
+/// `apply_podman_runtime_defaults` already do.
 fn apply_lxd_runtime_defaults(cfg: &mut LxdComputeConfig, context: DriverStartupContext<'_>) {
     if cfg.state_dir.as_os_str().is_empty() {
         cfg.state_dir = LxdComputeConfig::default_state_dir();
     }
-    if cfg.grpc_endpoint.trim().is_empty() && !context.gateway_tls_enabled {
-        // Unlike VM (which also serves guest-mTLS-capable https://
-        // endpoints), the LXD driver has no guest TLS material to deliver
-        // yet, so an https:// gateway can't be defaulted into here safely
-        // -- leave grpc_endpoint empty (spawn() itself rejects that with a
-        // clear error) rather than construct a URL the driver has no
-        // client certificate to actually dial.
-        //
-        // Critically, this is *not* "http://127.0.0.1:<port>" the way VM's
-        // own default is: an LXD sandbox is a real bridged network
-        // namespace, not a shared-loopback VM guest -- 127.0.0.1 from
-        // inside the sandbox is the sandbox's *own* loopback, entirely
-        // unrelated to the gateway's. This exact bug shipped once already
-        // and was only caught by a real run (run-managed-driver.sh):
-        // CreateSandbox itself succeeded, but the supervisor inside the
-        // container could never reach a gateway address that didn't
-        // actually route to it, so it never fetched its policy or
-        // reported Ready -- indistinguishable, from the CLI's own
-        // wait-for-ready timeout, from a dozen other "never becomes
-        // Ready" causes already debugged this same week. Derive the
-        // bridge's own gateway-facing address from network_ipv4_subnet
-        // instead -- the exact address ensure_network() (client.rs)
-        // configures as the bridge's own ipv4.address, and the same value
-        // run-stage2.sh/run-stage2-oci.sh's own BRIDGE_GATEWAY_IP
-        // ("${BRIDGE_SUBNET%/*}") already computes by hand and passes
-        // explicitly, now proven working across many real runs.
+    // Critically, this is *not* "http://127.0.0.1:<port>" the way VM's own
+    // default is: an LXD sandbox is a real bridged network namespace, not
+    // a shared-loopback VM guest -- 127.0.0.1 from inside the sandbox is
+    // the sandbox's *own* loopback, entirely unrelated to the gateway's.
+    // This exact bug shipped once already and was only caught by a real
+    // run (run-managed-driver.sh): CreateSandbox itself succeeded, but the
+    // supervisor inside the container could never reach a gateway address
+    // that didn't actually route to it, so it never fetched its policy or
+    // reported Ready -- indistinguishable, from the CLI's own
+    // wait-for-ready timeout, from a dozen other "never becomes Ready"
+    // causes already debugged this same week. Derive the bridge's own
+    // gateway-facing address from network_ipv4_subnet instead -- the exact
+    // address ensure_network() (client.rs) configures as the bridge's own
+    // ipv4.address, and the same value run-stage2.sh/run-stage2-oci.sh's
+    // own BRIDGE_GATEWAY_IP ("${BRIDGE_SUBNET%/*}") already computes by
+    // hand and passes explicitly, now proven working across many real
+    // runs. Only default when either the gateway itself is plaintext, or
+    // guest TLS material is actually available to dial an https:// gateway
+    // with -- mirrors apply_vm_runtime_defaults's identical condition:
+    // constructing an https:// URL the driver has no client certificate
+    // for would just move today's "empty grpc_endpoint" failure to a less
+    // obvious "TLS handshake failed" one instead.
+    if cfg.grpc_endpoint.trim().is_empty()
+        && (!context.gateway_tls_enabled || context.guest_tls.is_some())
+    {
+        let scheme = if context.gateway_tls_enabled {
+            "https"
+        } else {
+            "http"
+        };
         let bridge_gateway_ip = cfg
             .network_ipv4_subnet
             .split('/')
             .next()
             .filter(|addr| !addr.trim().is_empty())
             .unwrap_or("127.0.0.1");
-        cfg.grpc_endpoint = format!("http://{bridge_gateway_ip}:{}", context.gateway_port);
+        cfg.grpc_endpoint = format!("{scheme}://{bridge_gateway_ip}:{}", context.gateway_port);
     }
+
+    apply_guest_tls_defaults_to_split_fields(
+        &mut cfg.guest_tls_ca,
+        &mut cfg.guest_tls_cert,
+        &mut cfg.guest_tls_key,
+        context.guest_tls,
+    );
 }
 
 fn apply_guest_tls_defaults_to_split_fields(
@@ -397,5 +408,69 @@ grpc_endpoint = "http://host.openshell.internal:9999"
         let cfg = lxd_config_from_context(test_context(Some(&file))).expect("lxd config");
 
         assert_eq!(cfg.grpc_endpoint, "http://host.openshell.internal:9999");
+    }
+
+    #[test]
+    fn lxd_config_defaults_to_https_bridge_endpoint_and_fills_guest_tls_when_available() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.lxd]
+supervisor_bin = "/usr/local/libexec/openshell/openshell-sandbox"
+network_ipv4_subnet = "10.88.77.1/24"
+"#,
+        )
+        .expect("valid config");
+        let guest_tls = GuestTlsPaths {
+            ca: PathBuf::from("/etc/openshell/local-tls/ca.crt"),
+            cert: PathBuf::from("/etc/openshell/local-tls/client.crt"),
+            key: PathBuf::from("/etc/openshell/local-tls/client.key"),
+        };
+        let context = DriverStartupContext {
+            file: Some(&file),
+            guest_tls: Some(&guest_tls),
+            gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_tls_enabled: true,
+            endpoint_overrides: &BTreeMap::new(),
+        };
+
+        let cfg = lxd_config_from_context(context).expect("lxd config");
+
+        assert_eq!(
+            cfg.grpc_endpoint,
+            format!(
+                "https://10.88.77.1:{}",
+                openshell_core::config::DEFAULT_SERVER_PORT
+            )
+        );
+        assert_eq!(cfg.guest_tls_ca, Some(guest_tls.ca));
+        assert_eq!(cfg.guest_tls_cert, Some(guest_tls.cert));
+        assert_eq!(cfg.guest_tls_key, Some(guest_tls.key));
+    }
+
+    #[test]
+    fn lxd_config_leaves_grpc_endpoint_empty_when_gateway_tls_enabled_without_guest_tls() {
+        // Constructing an https:// URL with no client certificate to dial
+        // it with would just trade today's clear "grpc_endpoint is
+        // required" spawn-time error for a much less obvious TLS handshake
+        // failure inside the driver subprocess -- see
+        // apply_lxd_runtime_defaults's own doc comment.
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.lxd]
+network_ipv4_subnet = "10.88.77.1/24"
+"#,
+        )
+        .expect("valid config");
+        let context = DriverStartupContext {
+            file: Some(&file),
+            guest_tls: None,
+            gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_tls_enabled: true,
+            endpoint_overrides: &BTreeMap::new(),
+        };
+
+        let cfg = lxd_config_from_context(context).expect("lxd config");
+
+        assert!(cfg.grpc_endpoint.is_empty());
     }
 }

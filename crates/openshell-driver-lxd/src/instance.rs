@@ -114,6 +114,9 @@ const DEVICE_SUPERVISOR_BIN: &str = "openshell-supervisor";
 const DEVICE_SANDBOX_JWT: &str = "openshell-jwt";
 const DEVICE_ENTRYPOINT: &str = "openshell-entrypoint";
 const DEVICE_ETH0: &str = "eth0";
+const DEVICE_TLS_CA: &str = "openshell-tls-ca";
+const DEVICE_TLS_CERT: &str = "openshell-tls-cert";
+const DEVICE_TLS_KEY: &str = "openshell-tls-key";
 
 /// In-instance paths the disk devices above are mounted at.
 pub const SUPERVISOR_BIN_GUEST_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
@@ -158,6 +161,288 @@ pub fn instance_name(sandbox: &DriverSandbox) -> Result<String, ComputeDriverErr
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
+}
+
+/// Parsed, LXD-ready resource limits for one sandbox instance.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LxdResourceLimits {
+    /// `limits.cpu.allowance` value, e.g. `"50ms/100ms"`.
+    ///
+    /// Deliberately *not* `limits.cpu` (a whole-core count/CPU-set
+    /// pinning primitive — see its own doc comment in the LXD instance
+    /// options reference) despite the implementation plan's shorthand
+    /// wording ("map onto `limits.cpu`"): `limits.cpu` bare would only
+    /// let this driver express whole-core-or-more, throwing away any
+    /// request finer than 1 full core and changing what `nproc` reports
+    /// inside the sandbox — a materially different guest-visible effect
+    /// from Docker's `--cpus`/Podman's CFS quota, both of which throttle
+    /// via cgroup bandwidth control without restricting visible CPU
+    /// count. `limits.cpu.allowance`'s "chunk of time" form
+    /// (`"<quota>ms/<period>ms"`) is LXD's own cgroup-CFS-bandwidth
+    /// equivalent of exactly that mechanism (a *hard* cap, not the
+    /// percentage form's soft/burstable one) — the actually-equivalent
+    /// mapping for a Kubernetes-style `cpu_limit`, which is itself a hard
+    /// CFS quota under Kubernetes' own hood.
+    cpu_allowance: Option<String>,
+    /// `limits.memory` value in plain bytes with LXD's `B` suffix, e.g.
+    /// `"536870912B"` — avoids picking a "nice" MiB/GiB display unit and
+    /// any associated rounding; LXD parses `B` as an exact
+    /// multiply-by-one suffix (see the "Units for storage and network
+    /// limits" reference).
+    memory_bytes: Option<String>,
+}
+
+/// Parse `template.resources` into LXD-ready limit strings.
+///
+/// Fails loudly on a malformed or non-positive quantity (mirrors the
+/// Docker driver's `docker_resource_limits`/`parse_cpu_limit`/
+/// `parse_memory_limit`, not the Podman driver's fall-back-to-a-default
+/// behavior on parse failure — a malformed operator- or sandbox-supplied
+/// quantity silently becoming "whatever the default happens to be" is a
+/// worse failure mode for a new driver to inherit than a clear rejection
+/// at create time). `cpu_request`/`memory_request` are explicitly
+/// rejected, not silently ignored: LXD, like Docker, has no
+/// minimum-reservation primitive distinct from its limit (its own
+/// `limits.memory.enforce=soft` means "may exceed the *limit* under
+/// pressure", not "guaranteed floor" — not a valid mapping target for a
+/// *request*).
+fn lxd_resource_limits(
+    template: Option<&openshell_core::proto::compute::v1::DriverSandboxTemplate>,
+) -> Result<LxdResourceLimits, ComputeDriverError> {
+    let Some(resources) = template.and_then(|t| t.resources.as_ref()) else {
+        return Ok(LxdResourceLimits::default());
+    };
+
+    if !resources.cpu_request.trim().is_empty() {
+        return Err(ComputeDriverError::Precondition(
+            "lxd compute driver does not support resources.requests.cpu".to_string(),
+        ));
+    }
+    if !resources.memory_request.trim().is_empty() {
+        return Err(ComputeDriverError::Precondition(
+            "lxd compute driver does not support resources.requests.memory".to_string(),
+        ));
+    }
+
+    Ok(LxdResourceLimits {
+        cpu_allowance: parse_cpu_allowance(&resources.cpu_limit)?,
+        memory_bytes: parse_memory_bytes(&resources.memory_limit)?,
+    })
+}
+
+/// Parse a Kubernetes-style CPU quantity (`"500m"`, `"2"`, `"1.5"`) into
+/// an LXD `limits.cpu.allowance` "chunk of time" string against a fixed
+/// 100ms period -- see [`LxdResourceLimits::cpu_allowance`]'s doc comment
+/// for why this key, not bare `limits.cpu`.
+const CPU_ALLOWANCE_PERIOD_MS: u64 = 100;
+
+fn parse_cpu_allowance(value: &str) -> Result<Option<String>, ComputeDriverError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let cores = if let Some(millicores) = value.strip_suffix('m') {
+        let millicores = millicores.parse::<f64>().map_err(|_| {
+            ComputeDriverError::Precondition(format!(
+                "invalid lxd cpu_limit '{value}'; expected an integer or millicore quantity",
+            ))
+        })?;
+        millicores / 1000.0
+    } else {
+        value.parse::<f64>().map_err(|_| {
+            ComputeDriverError::Precondition(format!(
+                "invalid lxd cpu_limit '{value}'; expected an integer or millicore quantity",
+            ))
+        })?
+    };
+    if !cores.is_finite() || cores <= 0.0 {
+        return Err(ComputeDriverError::Precondition(
+            "lxd cpu_limit must be greater than zero".to_string(),
+        ));
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let quota_ms = (cores * CPU_ALLOWANCE_PERIOD_MS as f64).round().max(1.0) as u64;
+    Ok(Some(format!("{quota_ms}ms/{CPU_ALLOWANCE_PERIOD_MS}ms")))
+}
+
+/// Parse a Kubernetes-style memory quantity (`"512Mi"`, `"2Gi"`, `"1G"`)
+/// into an exact byte count formatted with LXD's plain-bytes `B` suffix.
+/// Supports both Kubernetes' binary (`Ki`/`Mi`/`Gi`/...) and decimal
+/// (`K`/`M`/`G`/...) suffixes, and a bare byte count with no suffix.
+fn parse_memory_bytes(value: &str) -> Result<Option<String>, ComputeDriverError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let number_end = value
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(number_end);
+    let amount = number.parse::<f64>().map_err(|_| {
+        ComputeDriverError::Precondition(format!(
+            "invalid lxd memory_limit '{value}'; expected a Kubernetes-style quantity",
+        ))
+    })?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(ComputeDriverError::Precondition(
+            "lxd memory_limit must be greater than zero".to_string(),
+        ));
+    }
+
+    let multiplier = match suffix {
+        "" => 1_f64,
+        "Ki" => 1024_f64,
+        "Mi" => 1024_f64.powi(2),
+        "Gi" => 1024_f64.powi(3),
+        "Ti" => 1024_f64.powi(4),
+        "Pi" => 1024_f64.powi(5),
+        "Ei" => 1024_f64.powi(6),
+        "K" => 1000_f64,
+        "M" => 1000_f64.powi(2),
+        "G" => 1000_f64.powi(3),
+        "T" => 1000_f64.powi(4),
+        "P" => 1000_f64.powi(5),
+        "E" => 1000_f64.powi(6),
+        _ => {
+            return Err(ComputeDriverError::Precondition(format!(
+                "invalid lxd memory_limit suffix '{suffix}'",
+            )));
+        }
+    };
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bytes = (amount * multiplier).round() as u64;
+    Ok(Some(format!("{bytes}B")))
+}
+
+/// Validate and translate a driver-config-level PIDs limit
+/// (`config.sandbox_pids_limit`) into LXD's `limits.processes` value.
+/// Mirrors `openshell-driver-docker`'s `docker_pids_limit` exactly: `< 0`
+/// is a config error, `0` inherits LXD's own default (unlimited, so no
+/// `limits.processes` key at all rather than an explicit `"0"`, which
+/// LXD would otherwise interpret as *zero processes allowed*), `> 0` is
+/// passed through as-is.
+fn lxd_pids_limit(value: i64) -> Result<Option<String>, ComputeDriverError> {
+    if value < 0 {
+        return Err(ComputeDriverError::Precondition(
+            "lxd sandbox_pids_limit must be zero or greater".to_string(),
+        ));
+    }
+    if value == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
+}
+
+/// A single validated driver-config mount, ready to become a `disk`
+/// device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedLxdMount {
+    source: String,
+    target: String,
+    read_only: bool,
+}
+
+/// One entry of `template.driver_config.mounts` for the LXD driver.
+///
+/// **Scope decision: `bind` only** — no `volume`/`tmpfs`/`image`
+/// variants, unlike Docker/Podman's own mount-config enums. Those three
+/// each need machinery this driver doesn't have any other reason to
+/// build: `volume` would mean creating and garbage-collecting an
+/// LXD-managed custom storage volume (a real resource with its own
+/// lifecycle, not a bare config translation); `tmpfs` has no native LXD
+/// `disk`-device equivalent at all (would itself need a volume, backed
+/// by a tmpfs-capable storage driver, created first); `image` (OCI image
+/// content mounted read-only) has no LXD equivalent whatsoever. `bind`
+/// alone maps onto a plain `disk` device with a host-path `source` — the
+/// same primitive this driver already uses for the supervisor binary,
+/// JWT, and TLS material (`build_instance_spec`) — with no new resource
+/// type to create or clean up. Revisit if a real use case needs one of
+/// the other three.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum LxdDriverMountConfig {
+    Bind {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LxdSandboxDriverConfig {
+    mounts: Vec<LxdDriverMountConfig>,
+}
+
+impl LxdSandboxDriverConfig {
+    /// Parse `template.driver_config` (a `google.protobuf.Struct`) into
+    /// this driver's own typed mount config. Mirrors Docker's
+    /// `DockerSandboxDriverConfig::from_template` exactly, reusing the
+    /// same shared JSON bridge (`openshell_core::proto_struct`) rather
+    /// than hand-walking the `Struct`.
+    fn from_template(
+        template: &openshell_core::proto::compute::v1::DriverSandboxTemplate,
+    ) -> Result<Self, String> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+        serde_json::from_value(openshell_core::proto_struct::struct_to_json_value(config))
+            .map_err(|err| format!("invalid lxd driver_config: {err}"))
+    }
+}
+
+/// Validate every driver-config mount and translate it into a validated,
+/// device-ready form. Reuses `openshell_core::driver_mounts` wholesale
+/// for source/target validation — the exact same rules Docker/Podman
+/// enforce (absolute host paths, no reserved-path collisions, no
+/// duplicate targets), not a reimplementation.
+fn validated_lxd_mounts(
+    mounts: &[LxdDriverMountConfig],
+    enable_bind_mounts: bool,
+) -> Result<Vec<ValidatedLxdMount>, ComputeDriverError> {
+    let mut targets = std::collections::HashSet::new();
+    let mut validated = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let LxdDriverMountConfig::Bind {
+            source,
+            target,
+            read_only,
+        } = mount;
+        if !enable_bind_mounts {
+            return Err(ComputeDriverError::Precondition(
+                "lxd bind mounts require enable_bind_mounts = true in [openshell.drivers.lxd]"
+                    .to_string(),
+            ));
+        }
+        openshell_core::driver_mounts::validate_absolute_mount_source(source, "bind source")
+            .map_err(ComputeDriverError::Precondition)?;
+        openshell_core::driver_mounts::validate_container_mount_target(target)
+            .map_err(ComputeDriverError::Precondition)?;
+        let normalized_target = openshell_core::driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
+            return Err(ComputeDriverError::Precondition(format!(
+                "duplicate lxd driver_config mount target '{normalized_target}'"
+            )));
+        }
+        validated.push(ValidatedLxdMount {
+            source: source.clone(),
+            target: normalized_target,
+            read_only: *read_only,
+        });
+    }
+    Ok(validated)
 }
 
 /// Build the full `POST /1.0/instances` request body for a sandbox.
@@ -289,6 +574,41 @@ pub fn build_instance_spec(
         Value::String(ssh_socket_path),
     );
 
+    // Resource limits (Phase 2, Step 6). `template.resources` is
+    // sandbox-supplied (a request, not a driver setting), so it's read
+    // straight from `sandbox`; `sandbox_pids_limit` is a driver-config
+    // knob, so it comes from `config` instead -- see each function's own
+    // doc comment for why they're validated/parsed the way they are.
+    let resource_limits = lxd_resource_limits(
+        sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref()),
+    )?;
+    if let Some(allowance) = resource_limits.cpu_allowance {
+        instance_config.insert("limits.cpu.allowance".to_string(), Value::String(allowance));
+    }
+    if let Some(memory) = resource_limits.memory_bytes {
+        instance_config.insert("limits.memory".to_string(), Value::String(memory));
+    }
+    if let Some(processes) = lxd_pids_limit(config.sandbox_pids_limit)? {
+        instance_config.insert("limits.processes".to_string(), Value::String(processes));
+    }
+
+    // Driver-config mounts (Phase 2, Step 7). Parsed here (validation
+    // doesn't need `devices` yet), translated into devices below once
+    // `devices` exists.
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref());
+    let driver_mounts = match template {
+        Some(template) => LxdSandboxDriverConfig::from_template(template)
+            .map_err(ComputeDriverError::Precondition)?,
+        None => LxdSandboxDriverConfig::default(),
+    };
+    let validated_mounts = validated_lxd_mounts(&driver_mounts.mounts, config.enable_bind_mounts)?;
+
     let mut devices = serde_json::Map::new();
     devices.insert(
         DEVICE_ETH0.to_string(),
@@ -321,6 +641,19 @@ pub fn build_instance_spec(
             "shift": "true",
         }),
     );
+
+    for (index, mount) in validated_mounts.iter().enumerate() {
+        devices.insert(
+            format!("openshell-mount-{index}"),
+            json!({
+                "type": "disk",
+                "source": mount.source,
+                "path": mount.target,
+                "readonly": mount.read_only.to_string(),
+                "shift": "true",
+            }),
+        );
+    }
 
     if let Some(token_path) = sandbox
         .spec
@@ -362,6 +695,67 @@ pub fn build_instance_spec(
                 openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
             ),
             Value::String(SANDBOX_JWT_GUEST_PATH.to_string()),
+        );
+    }
+
+    // Guest mTLS material (Phase 2, Step 5). `config.validate()` already
+    // enforces "all three or none" at driver startup
+    // (`LxdComputeConfig::validate_tls_config`), so by the time this runs,
+    // either all three are `Some` or all three are `None` — this `if let`
+    // is a straightforward gate on the already-validated invariant, not a
+    // second place that invariant needs re-checking. Delivered via the
+    // same read-only `shift=true` disk-device mechanism as the supervisor
+    // binary and JWT above, to the same fixed guest paths Docker/Podman/VM
+    // already use (`openshell_core::container_paths::TLS_*_MOUNT_PATH`),
+    // so the supervisor's own TLS-loading code
+    // (`openshell_core::grpc_client`) works identically regardless of
+    // which driver delivered the certificates.
+    if let (Some(ca), Some(cert), Some(key)) = (
+        &config.guest_tls_ca,
+        &config.guest_tls_cert,
+        &config.guest_tls_key,
+    ) {
+        devices.insert(
+            DEVICE_TLS_CA.to_string(),
+            json!({
+                "type": "disk",
+                "source": ca.display().to_string(),
+                "path": openshell_core::container_paths::TLS_CA_MOUNT_PATH,
+                "readonly": "true",
+                "shift": "true",
+            }),
+        );
+        devices.insert(
+            DEVICE_TLS_CERT.to_string(),
+            json!({
+                "type": "disk",
+                "source": cert.display().to_string(),
+                "path": openshell_core::container_paths::TLS_CERT_MOUNT_PATH,
+                "readonly": "true",
+                "shift": "true",
+            }),
+        );
+        devices.insert(
+            DEVICE_TLS_KEY.to_string(),
+            json!({
+                "type": "disk",
+                "source": key.display().to_string(),
+                "path": openshell_core::container_paths::TLS_KEY_MOUNT_PATH,
+                "readonly": "true",
+                "shift": "true",
+            }),
+        );
+        instance_config.insert(
+            format!("environment.{}", openshell_core::sandbox_env::TLS_CA),
+            Value::String(openshell_core::container_paths::TLS_CA_MOUNT_PATH.to_string()),
+        );
+        instance_config.insert(
+            format!("environment.{}", openshell_core::sandbox_env::TLS_CERT),
+            Value::String(openshell_core::container_paths::TLS_CERT_MOUNT_PATH.to_string()),
+        );
+        instance_config.insert(
+            format!("environment.{}", openshell_core::sandbox_env::TLS_KEY),
+            Value::String(openshell_core::container_paths::TLS_KEY_MOUNT_PATH.to_string()),
         );
     }
 
@@ -1136,6 +1530,543 @@ mod tests {
                     openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
                 ))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_cpu_allowance_supports_cores_and_millicores() {
+        assert_eq!(
+            parse_cpu_allowance("250m").unwrap(),
+            Some("25ms/100ms".to_string())
+        );
+        assert_eq!(
+            parse_cpu_allowance("2").unwrap(),
+            Some("200ms/100ms".to_string())
+        );
+        assert_eq!(
+            parse_cpu_allowance("1.5").unwrap(),
+            Some("150ms/100ms".to_string())
+        );
+        assert_eq!(parse_cpu_allowance("").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_cpu_allowance_rejects_zero_and_negative_and_malformed() {
+        assert!(parse_cpu_allowance("0").is_err());
+        assert!(parse_cpu_allowance("-1").is_err());
+        assert!(parse_cpu_allowance("not-a-number").is_err());
+    }
+
+    #[test]
+    fn parse_memory_bytes_supports_binary_and_decimal_quantities() {
+        assert_eq!(
+            parse_memory_bytes("512Mi").unwrap(),
+            Some("536870912B".to_string())
+        );
+        assert_eq!(
+            parse_memory_bytes("1G").unwrap(),
+            Some("1000000000B".to_string())
+        );
+        assert_eq!(
+            parse_memory_bytes("2Gi").unwrap(),
+            Some("2147483648B".to_string())
+        );
+        assert_eq!(parse_memory_bytes("").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_memory_bytes_rejects_zero_negative_and_unknown_suffix() {
+        assert!(parse_memory_bytes("0").is_err());
+        assert!(parse_memory_bytes("-1Gi").is_err());
+        assert!(parse_memory_bytes("12XB").is_err());
+    }
+
+    #[test]
+    fn lxd_pids_limit_zero_inherits_and_negative_errors() {
+        assert_eq!(lxd_pids_limit(0).unwrap(), None);
+        assert_eq!(lxd_pids_limit(2048).unwrap(), Some("2048".to_string()));
+        assert!(lxd_pids_limit(-1).is_err());
+    }
+
+    #[test]
+    fn lxd_resource_limits_rejects_cpu_and_memory_requests() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+
+        let with_cpu_request = openshell_core::proto::compute::v1::DriverSandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_request: "500m".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = lxd_resource_limits(Some(&with_cpu_request)).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+
+        let with_memory_request = openshell_core::proto::compute::v1::DriverSandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                memory_request: "256Mi".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = lxd_resource_limits(Some(&with_memory_request)).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+    }
+
+    #[test]
+    fn lxd_resource_limits_applies_cpu_and_memory_limits() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+
+        let template = openshell_core::proto::compute::v1::DriverSandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "500m".to_string(),
+                memory_limit: "2Gi".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let limits = lxd_resource_limits(Some(&template)).expect("limits parse");
+        assert_eq!(limits.cpu_allowance, Some("50ms/100ms".to_string()));
+        assert_eq!(limits.memory_bytes, Some("2147483648B".to_string()));
+    }
+
+    #[test]
+    fn lxd_resource_limits_is_empty_without_a_template() {
+        assert_eq!(
+            lxd_resource_limits(None).unwrap(),
+            LxdResourceLimits::default()
+        );
+    }
+
+    #[test]
+    fn build_instance_spec_applies_resource_limits_from_template() {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let sandbox = DriverSandbox {
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    resources: Some(DriverResourceRequirements {
+                        cpu_limit: "2".to_string(),
+                        memory_limit: "512Mi".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..test_sandbox()
+        };
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            sandbox_pids_limit: 512,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        assert_eq!(
+            spec["config"]["limits.cpu.allowance"],
+            Value::String("200ms/100ms".to_string())
+        );
+        assert_eq!(
+            spec["config"]["limits.memory"],
+            Value::String("536870912B".to_string())
+        );
+        assert_eq!(
+            spec["config"]["limits.processes"],
+            Value::String("512".to_string())
+        );
+    }
+
+    #[test]
+    fn build_instance_spec_omits_resource_limit_keys_by_default() {
+        let sandbox = test_sandbox();
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            sandbox_pids_limit: 0,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        assert!(spec["config"].get("limits.cpu.allowance").is_none());
+        assert!(spec["config"].get("limits.memory").is_none());
+        assert!(spec["config"].get("limits.processes").is_none());
+    }
+
+    #[test]
+    fn build_instance_spec_propagates_a_rejected_cpu_request() {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let sandbox = DriverSandbox {
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    resources: Some(DriverResourceRequirements {
+                        cpu_request: "100m".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..test_sandbox()
+        };
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let err = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect_err("cpu_request must be rejected");
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+    }
+
+    fn bind_mount_json(source: &str, target: &str, read_only: bool) -> Value {
+        json!({
+            "type": "bind",
+            "source": source,
+            "target": target,
+            "read_only": read_only,
+        })
+    }
+
+    fn driver_config_struct(mounts: Vec<Value>) -> prost_types::Struct {
+        let value = json!({ "mounts": mounts });
+        let Value::Object(object) = value else {
+            unreachable!()
+        };
+        openshell_core::proto_struct::json_object_to_struct(object).expect("valid struct")
+    }
+
+    fn sandbox_with_driver_config(driver_config: prost_types::Struct) -> DriverSandbox {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+        DriverSandbox {
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(driver_config),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..test_sandbox()
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_bind_mounts_unless_enabled() {
+        let sandbox = sandbox_with_driver_config(driver_config_struct(vec![bind_mount_json(
+            "/host/data",
+            "/sandbox/data",
+            true,
+        )]));
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: false,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let err = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect_err("bind mount must be rejected without enable_bind_mounts");
+        assert!(err.to_string().contains("enable_bind_mounts"));
+    }
+
+    #[test]
+    fn driver_config_delivers_an_enabled_bind_mount_as_a_disk_device() {
+        let sandbox = sandbox_with_driver_config(driver_config_struct(vec![bind_mount_json(
+            "/host/data",
+            "/sandbox/data",
+            false,
+        )]));
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: true,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        let device = &spec["devices"]["openshell-mount-0"];
+        assert_eq!(device["type"], "disk");
+        assert_eq!(device["source"], "/host/data");
+        assert_eq!(device["path"], "/sandbox/data");
+        assert_eq!(device["readonly"], "false");
+        assert_eq!(device["shift"], "true");
+    }
+
+    #[test]
+    fn driver_config_defaults_bind_mounts_to_read_only() {
+        let value = json!({
+            "mounts": [{
+                "type": "bind",
+                "source": "/host/data",
+                "target": "/sandbox/data",
+            }]
+        });
+        let Value::Object(object) = value else {
+            unreachable!()
+        };
+        let driver_config =
+            openshell_core::proto_struct::json_object_to_struct(object).expect("valid struct");
+        let sandbox = sandbox_with_driver_config(driver_config);
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: true,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        assert_eq!(spec["devices"]["openshell-mount-0"]["readonly"], "true");
+    }
+
+    #[test]
+    fn driver_config_rejects_relative_bind_source_when_enabled() {
+        let sandbox = sandbox_with_driver_config(driver_config_struct(vec![bind_mount_json(
+            "relative/path",
+            "/sandbox/data",
+            true,
+        )]));
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: true,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let err = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect_err("relative bind source must be rejected");
+        assert!(err.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn driver_config_rejects_reserved_mount_targets() {
+        let sandbox = sandbox_with_driver_config(driver_config_struct(vec![bind_mount_json(
+            "/host/data",
+            "/etc/openshell/tls/client",
+            true,
+        )]));
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: true,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let err = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect_err("reserved target must be rejected");
+        assert!(err.to_string().contains("/etc/openshell"));
+    }
+
+    #[test]
+    fn driver_config_rejects_duplicate_mount_targets() {
+        let sandbox = sandbox_with_driver_config(driver_config_struct(vec![
+            bind_mount_json("/host/a", "/sandbox/data", true),
+            bind_mount_json("/host/b", "/sandbox/data", true),
+        ]));
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: true,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let err = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect_err("duplicate target must be rejected");
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn driver_config_rejects_unknown_mount_type() {
+        let value = json!({
+            "mounts": [{
+                "type": "volume",
+                "source": "my-volume",
+                "target": "/sandbox/data",
+            }]
+        });
+        let Value::Object(object) = value else {
+            unreachable!()
+        };
+        let driver_config =
+            openshell_core::proto_struct::json_object_to_struct(object).expect("valid struct");
+        let sandbox = sandbox_with_driver_config(driver_config);
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            enable_bind_mounts: true,
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let err = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect_err("unsupported mount type must be rejected");
+        assert!(err.to_string().contains("invalid lxd driver_config"));
+    }
+
+    #[test]
+    fn build_instance_spec_has_no_mount_devices_without_driver_config() {
+        let sandbox = test_sandbox();
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        assert!(spec["devices"].get("openshell-mount-0").is_none());
+    }
+
+    #[test]
+    fn build_instance_spec_omits_tls_devices_when_unconfigured() {
+        let sandbox = test_sandbox();
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "http://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        assert!(spec["devices"].get(DEVICE_TLS_CA).is_none());
+        assert!(spec["devices"].get(DEVICE_TLS_CERT).is_none());
+        assert!(spec["devices"].get(DEVICE_TLS_KEY).is_none());
+        assert!(
+            spec["config"]
+                .get(format!(
+                    "environment.{}",
+                    openshell_core::sandbox_env::TLS_CA
+                ))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_instance_spec_delivers_tls_material_via_disk_devices_when_configured() {
+        let sandbox = test_sandbox();
+        let config = crate::config::LxdComputeConfig {
+            default_image: "openshell-sandbox-base".to_string(),
+            supervisor_bin: std::path::PathBuf::from("/opt/openshell/bin/openshell-sandbox"),
+            guest_tls_ca: Some(std::path::PathBuf::from("/etc/openshell/ca.pem")),
+            guest_tls_cert: Some(std::path::PathBuf::from("/etc/openshell/cert.pem")),
+            guest_tls_key: Some(std::path::PathBuf::from("/etc/openshell/key.pem")),
+            ..crate::config::LxdComputeConfig::default()
+        };
+        let spec = build_instance_spec(
+            &sandbox,
+            &config,
+            "https://10.88.77.1:8443",
+            &config.default_image,
+            &[],
+        )
+        .expect("spec builds");
+
+        assert_eq!(spec["devices"][DEVICE_TLS_CA]["type"], "disk");
+        assert_eq!(
+            spec["devices"][DEVICE_TLS_CA]["source"],
+            "/etc/openshell/ca.pem"
+        );
+        assert_eq!(
+            spec["devices"][DEVICE_TLS_CA]["path"],
+            openshell_core::container_paths::TLS_CA_MOUNT_PATH
+        );
+        assert_eq!(spec["devices"][DEVICE_TLS_CA]["readonly"], "true");
+        assert_eq!(spec["devices"][DEVICE_TLS_CA]["shift"], "true");
+        assert_eq!(
+            spec["devices"][DEVICE_TLS_CERT]["source"],
+            "/etc/openshell/cert.pem"
+        );
+        assert_eq!(
+            spec["devices"][DEVICE_TLS_KEY]["source"],
+            "/etc/openshell/key.pem"
+        );
+
+        assert_eq!(
+            spec["config"][format!("environment.{}", openshell_core::sandbox_env::TLS_CA)],
+            openshell_core::container_paths::TLS_CA_MOUNT_PATH
+        );
+        assert_eq!(
+            spec["config"][format!("environment.{}", openshell_core::sandbox_env::TLS_CERT)],
+            openshell_core::container_paths::TLS_CERT_MOUNT_PATH
+        );
+        assert_eq!(
+            spec["config"][format!("environment.{}", openshell_core::sandbox_env::TLS_KEY)],
+            openshell_core::container_paths::TLS_KEY_MOUNT_PATH
         );
     }
 
