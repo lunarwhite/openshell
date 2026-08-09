@@ -6,6 +6,7 @@
 use super::{
     DriverStartupContext, GuestTlsPaths, driver_config_from_context, driver_config_from_file,
 };
+use crate::compute::LxdComputeConfig;
 use crate::compute::VmComputeConfig;
 use crate::config_file;
 use openshell_core::{ComputeDriverKind, Error, Result};
@@ -64,6 +65,13 @@ pub fn vm_config_from_context(context: DriverStartupContext<'_>) -> Result<VmCom
     Ok(cfg)
 }
 
+/// Build the selected LXD config from TOML plus runtime defaults.
+pub fn lxd_config_from_context(context: DriverStartupContext<'_>) -> Result<LxdComputeConfig> {
+    let mut cfg = driver_config_from_context(context, ComputeDriverKind::Lxd.as_str())?;
+    apply_lxd_runtime_defaults(&mut cfg, context);
+    Ok(cfg)
+}
+
 fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         k8s.workspace_default_storage_size = size;
@@ -117,6 +125,51 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
         &mut cfg.guest_tls_key,
         context.guest_tls,
     );
+}
+
+/// LXD has no guest-mTLS callback support yet (Phase 2 Step 5, not yet
+/// built), so this doesn't call `apply_guest_tls_defaults_to_split_fields`
+/// the way `apply_vm_runtime_defaults`/`apply_podman_runtime_defaults` do
+/// — add that once `LxdComputeConfig` actually has `guest_tls_*` fields
+/// to fill in.
+fn apply_lxd_runtime_defaults(cfg: &mut LxdComputeConfig, context: DriverStartupContext<'_>) {
+    if cfg.state_dir.as_os_str().is_empty() {
+        cfg.state_dir = LxdComputeConfig::default_state_dir();
+    }
+    if cfg.grpc_endpoint.trim().is_empty() && !context.gateway_tls_enabled {
+        // Unlike VM (which also serves guest-mTLS-capable https://
+        // endpoints), the LXD driver has no guest TLS material to deliver
+        // yet, so an https:// gateway can't be defaulted into here safely
+        // -- leave grpc_endpoint empty (spawn() itself rejects that with a
+        // clear error) rather than construct a URL the driver has no
+        // client certificate to actually dial.
+        //
+        // Critically, this is *not* "http://127.0.0.1:<port>" the way VM's
+        // own default is: an LXD sandbox is a real bridged network
+        // namespace, not a shared-loopback VM guest -- 127.0.0.1 from
+        // inside the sandbox is the sandbox's *own* loopback, entirely
+        // unrelated to the gateway's. This exact bug shipped once already
+        // and was only caught by a real run (run-managed-driver.sh):
+        // CreateSandbox itself succeeded, but the supervisor inside the
+        // container could never reach a gateway address that didn't
+        // actually route to it, so it never fetched its policy or
+        // reported Ready -- indistinguishable, from the CLI's own
+        // wait-for-ready timeout, from a dozen other "never becomes
+        // Ready" causes already debugged this same week. Derive the
+        // bridge's own gateway-facing address from network_ipv4_subnet
+        // instead -- the exact address ensure_network() (client.rs)
+        // configures as the bridge's own ipv4.address, and the same value
+        // run-stage2.sh/run-stage2-oci.sh's own BRIDGE_GATEWAY_IP
+        // ("${BRIDGE_SUBNET%/*}") already computes by hand and passes
+        // explicitly, now proven working across many real runs.
+        let bridge_gateway_ip = cfg
+            .network_ipv4_subnet
+            .split('/')
+            .next()
+            .filter(|addr| !addr.trim().is_empty())
+            .unwrap_or("127.0.0.1");
+        cfg.grpc_endpoint = format!("http://{bridge_gateway_ip}:{}", context.gateway_port);
+    }
 }
 
 fn apply_guest_tls_defaults_to_split_fields(
@@ -273,5 +326,76 @@ mem_mib = "not-a-number"
             err.to_string()
                 .contains("invalid [openshell.drivers.vm] table")
         );
+    }
+
+    #[test]
+    fn lxd_config_defaults_grpc_endpoint_to_the_bridge_gateway_ip_not_loopback() {
+        // Regression test for a real bug: an earlier version of this
+        // function defaulted grpc_endpoint to "http://127.0.0.1:<port>",
+        // copying VM's own default verbatim. That's correct for VM (a
+        // guest sharing loopback via libkrun's own port-forwarding) but
+        // wrong for LXD: a sandbox is a real bridged network namespace,
+        // and 127.0.0.1 from inside it is the sandbox's *own* loopback,
+        // not the gateway's -- CreateSandbox itself would succeed (the
+        // LXD instance really gets created) while the supervisor inside
+        // it could never actually reach the gateway to fetch its policy,
+        // so the sandbox would silently never become Ready. Only a real
+        // gateway-managed run (run-managed-driver.sh) caught this --
+        // nothing about the RPC succeeding or failing surfaces it.
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.lxd]
+supervisor_bin = "/usr/local/libexec/openshell/openshell-sandbox"
+network_ipv4_subnet = "10.88.77.1/24"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = lxd_config_from_context(test_context(Some(&file))).expect("lxd config");
+
+        assert_eq!(
+            cfg.grpc_endpoint,
+            format!(
+                "http://10.88.77.1:{}",
+                openshell_core::config::DEFAULT_SERVER_PORT
+            ),
+            "grpc_endpoint should default to the bridge's own gateway IP \
+             (the address portion of network_ipv4_subnet), not 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn lxd_config_derives_grpc_endpoint_from_a_custom_subnet() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.lxd]
+network_ipv4_subnet = "192.168.99.1/24"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = lxd_config_from_context(test_context(Some(&file))).expect("lxd config");
+
+        assert!(
+            cfg.grpc_endpoint.starts_with("http://192.168.99.1:"),
+            "expected the custom subnet's own address, got: {}",
+            cfg.grpc_endpoint
+        );
+    }
+
+    #[test]
+    fn lxd_config_does_not_override_an_explicit_grpc_endpoint() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.lxd]
+network_ipv4_subnet = "10.88.77.1/24"
+grpc_endpoint = "http://host.openshell.internal:9999"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = lxd_config_from_context(test_context(Some(&file))).expect("lxd config");
+
+        assert_eq!(cfg.grpc_endpoint, "http://host.openshell.internal:9999");
     }
 }

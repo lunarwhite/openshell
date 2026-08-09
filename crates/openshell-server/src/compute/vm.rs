@@ -32,6 +32,8 @@
 use super::AcquiredRemoteDriverEndpoint;
 #[cfg(unix)]
 use super::ManagedDriverProcess;
+#[cfg(all(test, unix))]
+use super::managed_driver_hardening::current_euid;
 use crate::config_file::OtlpConfig;
 #[cfg(unix)]
 use crate::otel_tracing::TraceContextInterceptor;
@@ -43,12 +45,10 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(unix)]
-use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
+use std::{process::Stdio, sync::Arc, time::Duration};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
@@ -262,143 +262,21 @@ pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
         .join(COMPUTE_DRIVER_SOCKET_NAME)
 }
 
+/// Harden the VM driver's state dir and socket parent dir, and clear any
+/// stale socket, before binding — delegates to the shared
+/// [`super::managed_driver_hardening`] helpers (originally implemented
+/// here, extracted when the `lxd` managed driver needed the identical
+/// logic; see that module's doc comment).
 #[cfg(unix)]
 fn prepare_compute_driver_socket_path(
     vm_config: &VmComputeConfig,
     socket_path: &Path,
 ) -> Result<()> {
-    let expected_uid = current_euid();
-    prepare_vm_state_dir(&vm_config.state_dir, expected_uid)?;
-    let parent = socket_path.parent().ok_or_else(|| {
-        Error::execution(format!(
-            "vm compute driver socket path '{}' has no parent directory",
-            socket_path.display()
-        ))
-    })?;
-    prepare_private_socket_dir(parent, expected_uid)?;
-    remove_stale_socket(socket_path, expected_uid)
-}
-
-#[cfg(unix)]
-fn current_euid() -> u32 {
-    rustix::process::geteuid().as_raw()
-}
-
-#[cfg(unix)]
-fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
-    std::fs::create_dir_all(state_dir).map_err(|err| {
-        Error::execution(format!(
-            "failed to create vm driver state dir '{}': {err}",
-            state_dir.display()
-        ))
-    })?;
-    let metadata = checked_directory_metadata(state_dir, expected_uid, "vm driver state dir")?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
-            |err| {
-                Error::execution(format!(
-                    "failed to restrict vm driver state dir '{}': {err}",
-                    state_dir.display()
-                ))
-            },
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn prepare_private_socket_dir(socket_dir: &Path, expected_uid: u32) -> Result<()> {
-    std::fs::create_dir_all(socket_dir).map_err(|err| {
-        Error::execution(format!(
-            "failed to create vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })?;
-    let _ = checked_directory_metadata(socket_dir, expected_uid, "vm compute driver socket dir")?;
-    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
-        Error::execution(format!(
-            "failed to restrict vm compute driver socket dir '{}': {err}",
-            socket_dir.display()
-        ))
-    })
-}
-
-#[cfg(unix)]
-fn checked_directory_metadata(
-    path: &Path,
-    expected_uid: u32,
-    label: &str,
-) -> Result<std::fs::Metadata> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|err| {
-        Error::execution(format!(
-            "failed to stat {label} '{}': {err}",
-            path.display()
-        ))
-    })?;
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(Error::execution(format!(
-            "{label} '{}' is a symlink; refusing to use it",
-            path.display()
-        )));
-    }
-    if !file_type.is_dir() {
-        return Err(Error::execution(format!(
-            "{label} '{}' is not a directory",
-            path.display()
-        )));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::execution(format!(
-            "{label} '{}' is owned by uid {} but current euid is {}",
-            path.display(),
-            metadata.uid(),
-            expected_uid
-        )));
-    }
-    Ok(metadata)
-}
-
-#[cfg(unix)]
-fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(Error::execution(format!(
-                "failed to stat vm compute driver socket '{}': {err}",
-                socket_path.display()
-            )));
-        }
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is a symlink; refusing to remove it",
-            socket_path.display()
-        )));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(Error::execution(format!(
-            "vm compute driver socket '{}' is owned by uid {} but current euid is {}",
-            socket_path.display(),
-            metadata.uid(),
-            expected_uid
-        )));
-    }
-    if !file_type.is_socket() {
-        return Err(Error::execution(format!(
-            "vm compute driver socket path '{}' exists but is not a Unix socket",
-            socket_path.display()
-        )));
-    }
-    std::fs::remove_file(socket_path).map_err(|err| {
-        Error::execution(format!(
-            "failed to remove stale vm compute driver socket '{}': {err}",
-            socket_path.display()
-        ))
-    })
+    super::managed_driver_hardening::prepare_managed_driver_socket_path(
+        &vm_config.state_dir,
+        socket_path,
+        "vm",
+    )
 }
 
 #[cfg(unix)]
@@ -611,8 +489,7 @@ mod tests {
     use super::{
         VmComputeConfig, append_otlp_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
-        wait_for_compute_driver,
+        resolve_compute_driver_bin, resolve_driver_search_dirs, wait_for_compute_driver,
     };
     use crate::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
@@ -890,9 +767,10 @@ mod tests {
             current_euid() + 1
         };
 
-        let err = prepare_vm_state_dir(&state_dir, wrong_uid)
-            .expect_err("wrong owner should be rejected")
-            .to_string();
+        let err =
+            super::super::managed_driver_hardening::prepare_state_dir(&state_dir, wrong_uid, "vm")
+                .expect_err("wrong owner should be rejected")
+                .to_string();
         assert!(err.contains("is owned by uid"));
     }
 

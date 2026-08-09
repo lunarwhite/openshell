@@ -6,12 +6,17 @@
 pub mod driver_config;
 pub mod lease;
 #[cfg(not(target_os = "windows"))]
+pub mod lxd;
+#[cfg(not(target_os = "windows"))]
+mod managed_driver_hardening;
+#[cfg(not(target_os = "windows"))]
 pub mod vm;
 
-#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_docker::DockerComputeConfig;
 #[cfg(not(target_os = "windows"))]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(not(target_os = "windows"))]
+pub use lxd::LxdComputeConfig;
 #[cfg(not(target_os = "windows"))]
 pub use openshell_driver_podman::PodmanComputeConfig;
 #[cfg(not(target_os = "windows"))]

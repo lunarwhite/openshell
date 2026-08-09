@@ -125,6 +125,7 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    Lxd,
 }
 
 impl ComputeDriverKind {
@@ -135,6 +136,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::Lxd => "lxd",
         }
     }
 }
@@ -175,8 +177,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "lxd" => Ok(Self::Lxd),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, lxd"
             )),
         }
     }
@@ -185,7 +188,10 @@ impl FromStr for ComputeDriverKind {
 /// Auto-detect the appropriate compute driver based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
+/// VM and LXD are never auto-detected (require explicit `--drivers vm`/`--drivers lxd`) —
+/// LXD in particular has no rootless mode, so `lxd` group membership is
+/// host-root-equivalent; silently auto-selecting it would paper over a
+/// host-privilege statement the operator never consciously made.
 ///
 /// Returns the first driver where the environment check passes.
 /// Returns `None` if no compatible driver is found.

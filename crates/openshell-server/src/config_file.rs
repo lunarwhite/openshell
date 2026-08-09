@@ -477,6 +477,14 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        Some(ComputeDriverKind::Lxd) => &[
+            // No guest_tls_* here yet: the LXD driver has no mTLS callback
+            // support as of Phase 2 Step 3-4 (mTLS is Step 5, not yet
+            // built) — add those keys when that lands, matching Docker/
+            // Podman/VM's own inheritance once the fields actually exist
+            // on `LxdComputeConfig` to receive them.
+            "default_image",
+        ],
         Some(ComputeDriverKind::Vm) => &[
             "default_image",
             "guest_tls_ca",

@@ -165,6 +165,7 @@ pub enum TelemetryComputeDriver {
     Kubernetes,
     Podman,
     Vm,
+    Lxd,
     Unknown,
 }
 
@@ -176,6 +177,7 @@ impl TelemetryComputeDriver {
             Self::Kubernetes => "kubernetes",
             Self::Podman => "podman",
             Self::Vm => "vm",
+            Self::Lxd => "lxd",
             Self::Unknown => "unknown",
         }
     }
@@ -187,6 +189,7 @@ impl TelemetryComputeDriver {
             "k8s" | "kubernetes" => Self::Kubernetes,
             "podman" => Self::Podman,
             "vm" => Self::Vm,
+            "lxd" => Self::Lxd,
             _ => Self::Unknown,
         }
     }
@@ -198,6 +201,7 @@ impl TelemetryComputeDriver {
             Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
             Some(crate::ComputeDriverKind::Podman) => Self::Podman,
             Some(crate::ComputeDriverKind::Vm) => Self::Vm,
+            Some(crate::ComputeDriverKind::Lxd) => Self::Lxd,
             None => Self::Unknown,
         }
     }

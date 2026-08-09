@@ -740,13 +740,61 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # sandbox_uid = 20001
 ```
 
+### LXD
+
+Each sandbox runs as an LXD system container, managed by the standalone `openshell-driver-lxd` subprocess. Use this driver on Ubuntu hosts with LXD installed and no Docker, Podman, or Kubernetes available.
+
+`lxd` group membership is host-root-equivalent (LXD has no rootless mode), so this driver is never auto-detected — selecting it always requires the explicit config below, the same way `vm` does.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+# LXD is never auto-detected; an explicit entry here is required.
+compute_drivers = ["lxd"]
+
+[openshell.drivers.lxd]
+state_dir             = "/var/lib/openshell/lxd"
+# Where the gateway looks for the openshell-driver-lxd subprocess binary.
+driver_dir             = "/usr/local/libexec/openshell"
+# Host path to the openshell-sandbox supervisor binary, delivered into
+# each LXD instance via a read-only disk device. Falls back to the same
+# search path as driver_dir when unset, but set this explicitly in
+# production -- a wrong guess fails every sandbox create, not just
+# driver startup.
+supervisor_bin         = "/usr/local/libexec/openshell/openshell-sandbox"
+# The LXD daemon's own API socket, not this driver's.
+lxd_socket_path        = "/var/snap/lxd/common/lxd/unix.socket"
+default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
+# The gateway callback address the sandbox supervisor dials back to.
+# Unlike VM/Docker/Podman, an LXD sandbox is a real bridged network
+# namespace, not a shared-loopback guest or a container runtime with its
+# own host-alias DNS -- 127.0.0.1 or host.containers.internal-style
+# aliases do not resolve to anything reachable from inside it. Leave
+# this unset to have the gateway derive it automatically from
+# network_ipv4_subnet's own address (the bridge's gateway-facing IP);
+# set it explicitly only to override that derivation.
+grpc_endpoint          = "http://10.77.99.1:17670"
+network_name           = "openshell"
+network_ipv4_subnet    = "10.77.99.1/24"
+storage_pool           = "default"
+```
+
+All OpenShell-managed instances share LXD's own `default` project, filtered by the `user.openshell.sandbox_id`/`user.openshell.sandbox_name` labels the driver stamps on every instance it creates — not a dedicated per-tenant LXD project. This matches the Podman driver's shape; there is currently exactly one tenant (this gateway) per LXD daemon.
+
+Guest mTLS (the `guest_tls_*` fields Docker/Podman/VM support) is not yet implemented for this driver — `grpc_endpoint` must be `http://`, not `https://`.
+
 ### Extension Driver
 
 Extension drivers run outside the gateway and expose the
 `compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
-name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
-be selected through unmanaged socket endpoints. The selected driver name is the
-key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+name; built-in names such as `vm`, `docker`, `podman`, `lxd`, and `kubernetes`
+cannot be selected through unmanaged socket endpoints. The selected driver name
+is the key used for driver-owned sandbox config such as
+`template.driver_config.<name>`.
 
 ```toml
 [openshell]

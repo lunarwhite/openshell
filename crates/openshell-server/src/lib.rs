@@ -1177,6 +1177,26 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
             (rt, None)
         }
+        #[cfg(not(target_os = "windows"))]
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Lxd) => {
+            let lxd_config =
+                compute::driver_config::builtin::lxd_config_from_context(driver_startup)?;
+            let otlp_config = driver_startup
+                .file
+                .and_then(|file| file.openshell.gateway.otlp.as_ref());
+            let endpoint = compute::lxd::spawn(config, &lxd_config, otlp_config).await?;
+            let rt = ComputeRuntime::new_remote_driver(
+                endpoint,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
+        }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
@@ -1229,10 +1249,13 @@ fn configured_compute_driver(
             Some(ComputeDriverKind::Vm) => Err(Error::config(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
+            Some(ComputeDriverKind::Lxd) => Err(Error::config(
+                "lxd compute driver is opt-in only; set --drivers lxd or OPENSHELL_DRIVERS=lxd",
+            )),
             Some(driver) => Ok(ConfiguredComputeDriver::Builtin(driver)),
             None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
-                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
+                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, vm, or lxd",
             )),
         },
         [driver] => resolve_configured_compute_driver(driver, driver_startup),
@@ -1847,6 +1870,33 @@ mod tests {
             driver,
             ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm)
         ));
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_lxd() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Lxd]);
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Builtin(ComputeDriverKind::Lxd)
+        ));
+    }
+
+    #[test]
+    fn configured_compute_driver_rejects_lxd_endpoint_from_config() {
+        let config = Config::new(None)
+            .with_compute_drivers([ComputeDriverKind::Lxd])
+            .with_compute_driver_endpoint("lxd", "/run/openshell/lxd.sock");
+
+        let err =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("reserved built-in driver and cannot be selected with a socket endpoint"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
