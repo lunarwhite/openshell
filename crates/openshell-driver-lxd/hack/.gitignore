@@ -1,0 +1,9 @@
+# Timestamped run artifacts from these scripts (results/<name>-<timestamp>.md
+# plus a same-named raw-log directory) are local, ephemeral outputs, not
+# permanent history -- see ../docs/06-lessons-learned.md and
+# ../docs/04-implementation-plan.md for the durable, curated record of what
+# these runs found. Keep the directory itself (via .gitkeep) so a fresh
+# checkout has somewhere for the scripts to write without needing to
+# `mkdir -p` be the first thing every script does.
+results/*
+!results/.gitkeep
