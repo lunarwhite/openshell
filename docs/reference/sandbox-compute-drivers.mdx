@@ -578,6 +578,8 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 
 The LXD driver does not resolve or inject sandbox identity dynamically — the sandbox image must already declare a `sandbox` user and group in `/etc/passwd`/`/etc/group`. The driver neither inspects an OCI image's `USER` declaration the way Docker/Podman do, nor injects a UID/GID into the rootfs the way the VM driver does. A stock base image without a pre-baked `sandbox` user fails sandbox creation with `explicit process user 'sandbox' was not found in the image`; bake the user and group into the image at build time instead.
 
+The LXD driver also does not resolve the image's OCI `WORKDIR` — every LXD sandbox uses OpenShell's fixed `/sandbox` compatibility workspace regardless of what the image declares, the same as Podman/Kubernetes/VM sandboxes. Only Docker resolves `WORKDIR` into the workspace root (see "Custom Images" below); this is not yet ported to LXD.
+
 ### Custom Images
 
 Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare

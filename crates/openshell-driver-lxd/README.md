@@ -21,9 +21,13 @@
 > "What the Stage 2 pass does NOT prove" for the caveats before treating
 > this as production-ready. **Also implemented since (Phase 2, Steps
 > 5-8): guest mTLS, resource limits, driver-config bind mounts, and
-> rollback/reconciliation hardening — unit-test-verified only, not yet
-> exercised against a real daemon.** See "What's actually implemented"
-> below for both.
+> rollback/reconciliation hardening.** Per the developer's own report
+> (2026-08-19), a real-daemon re-run of `run-feature-parity.sh` passed
+> all four tests (mTLS, resource limits, driver-config mounts,
+> rollback) — but that run's own output was not captured, unlike every
+> other real-run claim in this file, so treat it as reported rather than
+> independently verified here until a logged re-run exists. See "What's
+> actually implemented" below for both.
 
 LXD compute driver for OpenShell — Phase 1 scope: LXD/LXC on Ubuntu,
 container-type instances only, run as an unmanaged extension driver (zero
@@ -229,8 +233,9 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   (`src/image.rs`) — real registry pull via `oci-client` (pure Rust, the
   same crate/version `openshell-driver-vm` already uses; no `skopeo`/
   `umoci` subprocess dependency), whiteout-aware layer merge, OCI image
-  config (`Env`/`WorkingDir`/`User`/entrypoint) translation into LXD
-  instance config, and digest-based caching via an
+  config parsing (`OciImageConfig`: `Env`/`WorkingDir`/`User`/
+  `Entrypoint`/`Cmd`, matching the OCI Image Spec's `config` object field
+  names), and digest-based caching via an
   `openshell-oci-<digest>` LXD image alias — checked *before* any layer
   download. Wired into `create_sandbox`: a sandbox with its own
   `spec.template.image` (the CLI's `--from`/BYOC flag) resolves through
@@ -241,6 +246,35 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   unified_tarball`, `create_image_alias`, `get_image_by_alias`) since
   none existed before — Phase 1 only ever consumed a manually
   pre-converted image, never uploaded one itself.
+  **Only `Env` actually reaches the instance spec — found auditing this
+  file's own wording against the code (2026-08-19), not by a run.**
+  `driver.rs` extracts just `converted.config.env` from the parsed
+  `OciImageConfig` before calling `build_instance_spec`; `working_dir`,
+  `user`, `entrypoint`, and `cmd` are all parsed correctly but then never
+  read again by anything. An earlier version of this bullet claimed
+  `WorkingDir`/`User`/entrypoint translation alongside `Env`, which
+  overstated this driver specifically and, checked against Docker's own
+  driver just now, doesn't even hold as a shared cross-driver non-goal:
+  `entrypoint`/`cmd` are correctly unused everywhere (this driver's own
+  entrypoint-script mechanism already replaces the image's PID 1, the
+  same way Docker/Podman/VM's supervisor-as-entrypoint approach does, so
+  the image's original `Entrypoint`/`Cmd` were never going to matter
+  regardless) — but `WorkingDir` is a real, LXD-specific gap, not a
+  universal one: Podman always uses a fixed `/sandbox` workspace
+  (confirmed no `working_dir`/`WorkingDir` handling anywhere in
+  `openshell-driver-podman`), but Docker *does* resolve the image's OCI
+  `WORKDIR` into the sandbox's workspace root
+  (`resolve_oci_workspace_root` in `openshell-driver-docker/src/lib.rs`,
+  documented in `docs/reference/sandbox-compute-drivers.mdx`'s "Custom
+  Images" section) — so LXD is the odd one out for `WorkingDir`, matching
+  Podman's behavior by accident of never having built the translation,
+  not by a considered design choice the way Podman's own fixed-workspace
+  convention is. `User`, unlike `WorkingDir`, was already correctly
+  disclosed as an accepted LXD-specific gap in
+  `docs/reference/sandbox-compute-drivers.mdx`'s "Sandbox User Identity"
+  → "LXD Driver" subsection — this bullet just didn't cross-reference it
+  before now. Neither gap is fixed here; both are now at least accurately
+  described instead of overstated.
   **First real run against ghcr.io and a real LXD daemon failed with
   `No space left on device` while packaging the converted image.** Root
   cause was a genuine design flaw, not the VM's disk alone: the pipeline
@@ -408,14 +442,24 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   identical digest right after (9s — roughly 25x faster, direct,
   measured evidence the whole point of the digest-cache design holds).
 - **Phase 2, Steps 5-8: mTLS, resource limits, driver-config mounts,
-  rollback/reconciliation hardening.** Unit-test-verified only — unlike
-  every item above, none of this has been exercised against a real LXD
-  daemon yet (no `run-stage2-oci.sh`/`run-managed-driver.sh` re-run with
-  these features enabled). Treat this bullet's claims as "the code path
-  exists and its unit tests pass," not "proven against a real daemon,"
-  until a real run says otherwise — every *other* claim in this file
-  earned that distinction from a real Stage 2 failure it caused and then
-  fixed; these four have not yet had that chance to be wrong.
+  rollback/reconciliation hardening.** Unit-test-verified directly; the
+  real-daemon path has a more qualified status than every other claim in
+  this file. Two logged `run-feature-parity.sh` runs against a real
+  daemon (`.claude/plans/lxd-test-results/feature-parity-
+  20260809T172551Z.md`, `...-20260809T174249Z.md`) each passed mTLS,
+  mounts, and rollback but failed resource limits specifically — Test B
+  couldn't read `/sys/fs/cgroup/cpu.max`/`memory.max` via `sandbox exec`
+  because the sandbox's own Landlock policy blocks that path from
+  *inside* the sandbox (fixed in the script by reading cgroup files via
+  `lxc exec` from the host instead, outside the sandbox's confinement —
+  a test-script fix, not a driver fix, since the driver never claimed
+  in-sandbox cgroup-path readability as a feature). The developer
+  reports (2026-08-19) a subsequent re-run with that script fix applied
+  passed all four tests, but did not capture that run's output, so
+  unlike the two runs above (and every other real-daemon claim in this
+  file), there is no logged artifact backing it — treat it as reported,
+  not independently verified from this file's own evidentiary standard,
+  until a logged re-run exists.
   - **mTLS** (`config.rs`'s `guest_tls_ca`/`guest_tls_cert`/
     `guest_tls_key`, validated "all three or none" by `validate_tls_config`):
     delivered via the same read-only `shift=true` disk-device mechanism
@@ -464,6 +508,35 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
     instance state (filtered by `user.openshell.sandbox_id`), never from
     any in-memory operation state this process could lose on restart —
     there was never any such state to begin with.
+- **The supervisor only handled `SIGTERM` as a graceful-shutdown signal —
+  never LXD's own PID-1 signal contract.** Found by auditing against the
+  implementation plan's own "LXD system-container constraints" #2
+  (`lxc stop` sends `SIGPWR`, `lxc restart` sends `SIGINT`, neither ever
+  `SIGTERM`), not by a real-daemon run reaching this path: every prior
+  real-daemon test exercised only `DeleteSandbox`, which calls LXD's
+  *forceful* stop (`force: true`) before deleting — forceful stop kills
+  the container's cgroup directly and never signals PID 1's own handlers
+  at all, so this gap was invisible to every test that only ever deletes
+  a sandbox rather than plain-stopping one. `StopSandbox` (the separate
+  RPC, distinct from delete) does call graceful stop (`force: false`),
+  which *would* have hit this gap the first time anything exercised it
+  against a real daemon. Without a handler, `SIGINT`/`SIGPWR` still
+  terminate the process (their kernel-default disposition), so the
+  container would still stop — but the supervisor's own graceful-shutdown
+  logic (signaling the entrypoint child, waiting for it to exit) would be
+  skipped entirely, indistinguishable from a crash rather than a clean
+  shutdown. Fixed in `openshell-supervisor-process/src/run.rs`'s
+  `wait_for_supervisor_shutdown_signal`: now races `SIGTERM`, `SIGINT`,
+  and (Linux-only — `SIGPWR` isn't defined on macOS/BSD) `SIGPWR`,
+  treating whichever arrives first identically. Two new regression tests
+  raise `SIGINT`/`SIGPWR` directly at the running process and assert the
+  future actually resolves rather than hanging (the `SIGPWR` case is
+  `#[cfg(target_os = "linux")]`-gated; the `SIGINT` case runs everywhere,
+  including this development machine). Still not covered: an actual real
+  `StopSandbox` call (not just delete) against a real LXD daemon, to
+  confirm `lxc stop`'s own `force: false` path really does deliver
+  `SIGPWR` in practice and not some other signal this reading of LXD's
+  docs got wrong.
 - **Phase 2, Step 9: expanded unit test coverage for lifecycle, network
   isolation, and interrupted delete.** `get_sandbox`/`list_sandboxes`/
   `stop_sandbox`/`delete_sandbox` had no unit tests at all before this —
@@ -524,11 +597,11 @@ Read this before treating the `pass` outcome above as more than "the
 happy path works end to end" — see `run-stage2.sh`'s own header comment
 for the authoritative list, summarized here:
 
-- **No TLS/mTLS.** The run uses `--disable-tls` throughout. A delivery
-  mechanism now exists (Phase 2, Step 5 — see "What's actually
-  implemented" below), but `run-stage2.sh`/`run-stage2-oci.sh` have not
-  been re-run with it enabled, so it remains unverified against a real
-  daemon.
+- **No TLS/mTLS in `run-stage2.sh`/`run-stage2-oci.sh` themselves** — both
+  still use `--disable-tls` throughout. A delivery mechanism now exists
+  (Phase 2, Step 5) and has its own dedicated real-daemon coverage via
+  `run-feature-parity.sh` instead (Test A) — see the Steps 5-8 bullet
+  under "What's actually implemented" for that run's status.
 - **Bypasses `_gateway.lxd`/`GetGatewayListenerRequirements` entirely**
   by passing the driver's own bridge gateway IP directly as
   `grpc_endpoint`. That code path in `driver.rs` remains unexercised.
@@ -555,6 +628,36 @@ for the authoritative list, summarized here:
   the design doc's risk section.
 - Multi-tenancy via LXD projects, GPU passthrough, clustering, Incus support
   — all explicit non-goals for now.
+- OCI `WorkingDir`/`User` translation into the sandbox's workspace/identity
+  — unlike the two items above, not a considered non-goal, just not yet
+  built (see the Phase 2 Step 1 bullet's 2026-08-19 audit note above for
+  the full account of what's parsed vs. actually used). `WorkingDir`
+  parity would mean matching Docker's `resolve_oci_workspace_root`;
+  `User` parity would mean matching Docker/Podman's OCI `USER` inspection
+  for dynamic UID/GID resolution (already tracked as a known gap in
+  `docs/reference/sandbox-compute-drivers.mdx`'s "Sandbox User Identity"
+  section). **A real trap for whoever builds `WorkingDir` parity next**:
+  Docker passes the resolved workspace root as its own array element in
+  the container's `Cmd` (`cmd: vec!["--workdir".into(), workspace_root]`)
+  — never shell-interpreted, since Docker's `Cmd` execs directly, no
+  shell involved. LXD has no equivalent non-shell argv-passing mechanism
+  for `lxc.init.cmd` — this driver's entrypoint is a *generated shell
+  script* (`build_entrypoint_script`), so naively porting Docker's
+  approach by string-formatting `workspace_root` straight into the
+  script's final `exec` line would be a real shell-injection path: the
+  value comes from an OCI image's declared `WORKDIR`, and
+  `resolve_oci_workspace_root`'s own validation (absolute, normalized, no
+  control characters) does *not* reject shell metacharacters like `"`,
+  `'`, `` ` ``, `$`, or `;` — those are all valid path-adjacent characters
+  it has no reason to reject at the path-validation layer. Any future
+  implementation must single-quote-escape the value for POSIX shell
+  (`'` → `'\''`, wrapped in `'...'`) before embedding it in the generated
+  script, the same way any dynamic value ever embedded in that script
+  must be, and add a regression test using a workspace root containing
+  shell metacharacters — not just a plain path — to actually catch a
+  regression here, mirroring how `build_entrypoint_script_survives_an_
+  unwritable_var_log_under_dash` catches *shell-semantics* bugs rather
+  than just checking the generated script's string content.
 
 ## Running it
 
