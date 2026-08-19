@@ -6,9 +6,11 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
@@ -128,6 +130,21 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .start_sandbox(&request.sandbox_id)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(StartSandboxResponse {}))
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -154,6 +171,26 @@ impl ComputeDriver for ComputeDriverService {
         let stream = self.driver.watch_sandboxes().await.map_err(Status::from)?;
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    // LXD has no per-tenant project/namespace concept this driver uses
+    // (Phase 2, Step 4's multi-tenancy decision: a single shared `default`
+    // LXD project for every managed instance, filtered by label) -- these
+    // are no-op stubs, matching the Podman and VM drivers' own identical
+    // treatment of RFC 0011 Phase 3's workspace-per-namespace feature,
+    // which is meaningful only for the Kubernetes driver's real namespaces.
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
@@ -186,6 +223,23 @@ mod tests {
         let err = ComputeDriver::delete_sandbox(
             &service,
             Request::new(DeleteSandboxRequest {
+                sandbox_id: String::new(),
+                sandbox_name: "demo".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing sandbox_id should fail");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "sandbox_id is required");
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_rejects_missing_sandbox_id() {
+        let service = test_service();
+        let err = ComputeDriver::start_sandbox(
+            &service,
+            Request::new(StartSandboxRequest {
                 sandbox_id: String::new(),
                 sandbox_name: "demo".to_string(),
             }),

@@ -389,6 +389,32 @@ impl LxdComputeDriver {
         Ok(())
     }
 
+    /// Start a previously-stopped sandbox instance. Idempotent: an
+    /// already-running instance is a no-op success rather than an error,
+    /// matching the Podman/VM drivers' own `start_sandbox` semantics.
+    /// Reuses `stop_timeout_secs` for the start operation's own timeout —
+    /// LXD's `PUT .../state` takes a single `timeout` field for either
+    /// direction, and this driver has no separate start-specific knob.
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+        let Some(instance) = self.find_instance_by_sandbox_id(sandbox_id).await? else {
+            return Err(ComputeDriverError::Message(format!(
+                "sandbox '{sandbox_id}' not found"
+            )));
+        };
+        if instance.status_code == crate::client::status_code::RUNNING {
+            return Ok(());
+        }
+        self.client
+            .set_instance_state(
+                &instance.name,
+                "start",
+                self.config.stop_timeout_secs,
+                false,
+            )
+            .await
+            .map_err(ComputeDriverError::from)
+    }
+
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
         let Some(instance) = self.find_instance_by_sandbox_id(sandbox_id).await? else {
             return Err(ComputeDriverError::Message(format!(
@@ -898,6 +924,105 @@ mod tests {
                 .any(|r| r == "PUT /1.0/instances/openshell-default-abc123/state"),
             "expected a state-change PUT for the resolved instance name: {requests:?}"
         );
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_returns_an_error_when_no_matching_instance_exists() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "start-sandbox-no-match",
+            vec![StubResponse::sync_success(serde_json::json!([]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        let err = driver
+            .start_sandbox("no-such-sandbox")
+            .await
+            .expect_err("starting an unknown sandbox should fail, not silently succeed");
+        assert!(err.to_string().contains("not found"));
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_issues_a_start_state_change_for_a_stopped_instance() {
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let stopped_instance = serde_json::json!({
+            "name": "openshell-default-abc123",
+            "status": "Stopped",
+            "status_code": crate::client::status_code::STOPPED,
+            "config": {
+                "user.openshell.sandbox_id": "abc123",
+                "user.openshell.sandbox_name": "demo",
+            }
+        });
+        let (socket_path, request_log, handle) = spawn_lxd_stub(
+            "start-sandbox-match",
+            vec![
+                // GET /1.0/instances?recursion=2 -- find the instance.
+                StubResponse::sync_success(serde_json::json!([stopped_instance])),
+                // PUT /1.0/instances/<name>/state -- start.
+                StubResponse::sync_success(serde_json::json!({})),
+            ],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        driver
+            .start_sandbox("abc123")
+            .await
+            .expect("start should succeed for a stopped, matching instance");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r == "PUT /1.0/instances/openshell-default-abc123/state"),
+            "expected a state-change PUT for the resolved instance name: {requests:?}"
+        );
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_is_a_noop_when_the_instance_is_already_running() {
+        // Idempotent by design (see start_sandbox's own doc comment) --
+        // matching the Podman/VM drivers' own start_sandbox semantics. The
+        // stub only ever serves the GET below; if the driver issued a PUT
+        // anyway, spawn_lxd_stub's fixed response queue would make that
+        // second request fail outright rather than this test silently
+        // passing for the wrong reason.
+        use crate::test_utils::{StubResponse, spawn_lxd_stub};
+
+        let (socket_path, _log, handle) = spawn_lxd_stub(
+            "start-sandbox-already-running",
+            vec![StubResponse::sync_success(serde_json::json!([
+                labeled_instance_json("abc123", "demo")
+            ]))],
+        );
+        let driver = LxdComputeDriver::for_tests(LxdComputeConfig {
+            socket_path: socket_path.clone(),
+            ..LxdComputeConfig::default()
+        });
+
+        driver
+            .start_sandbox("abc123")
+            .await
+            .expect("starting an already-running instance should succeed as a no-op");
+
+        handle.await.expect("stub task should finish");
         let _ = std::fs::remove_file(&socket_path);
     }
 
