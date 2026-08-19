@@ -497,24 +497,76 @@ fn signal_pid(pid: u32, signal: nix::sys::signal::Signal, reason: &'static str) 
     }
 }
 
+/// Races every signal that can mean "shut down" for this process and
+/// returns the name of whichever one arrives first.
+///
+/// `SIGTERM` covers Docker/Podman/Kubernetes' convention (and a plain
+/// `kill`). `SIGINT` covers both an interactive Ctrl-C and `lxc restart`,
+/// which sends it to a container's PID 1. Neither of those is LXD's own
+/// *clean shutdown* signal, though: `lxc stop` sends `SIGPWR` (a System-V
+/// signal repurposed by LXD as the container-lifecycle "power failure /
+/// clean shutdown" convention — see the LXD container-environment
+/// reference), never `SIGTERM`. Without this, a supervisor running as an
+/// LXD container's PID 1 would receive `SIGPWR` on every `lxc stop`, catch
+/// none of these handlers, and fall through to the kernel's default
+/// disposition for that signal (process termination) — exiting for real,
+/// but skipping every bit of this function's own graceful-shutdown
+/// signaling of the entrypoint child. `SIGPWR` is not a POSIX-portable
+/// signal (absent on macOS/BSD), hence the Linux-only branch below.
 #[cfg(unix)]
 async fn wait_for_supervisor_shutdown_signal() -> &'static str {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(signal) => signal,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to install SIGTERM handler; supervisor shutdown detection disabled"
-            );
-            return std::future::pending::<&'static str>().await;
-        }
-    };
+    let sigterm = signal(SignalKind::terminate());
+    if let Err(error) = &sigterm {
+        tracing::warn!(error = %error, "Failed to install SIGTERM handler");
+    }
+    let sigint = signal(SignalKind::interrupt());
+    if let Err(error) = &sigint {
+        tracing::warn!(error = %error, "Failed to install SIGINT handler");
+    }
 
-    let _ = sigterm.recv().await;
-    info!("Received SIGTERM, shutting down supervisor process");
-    "SIGTERM"
+    #[cfg(target_os = "linux")]
+    {
+        let sigpwr = signal(SignalKind::from_raw(
+            nix::sys::signal::Signal::SIGPWR as i32,
+        ));
+        if let Err(error) = &sigpwr {
+            tracing::warn!(error = %error, "Failed to install SIGPWR handler");
+        }
+        tokio::select! {
+            signal = recv_shutdown_signal(sigterm, "SIGTERM") => signal,
+            signal = recv_shutdown_signal(sigint, "SIGINT") => signal,
+            signal = recv_shutdown_signal(sigpwr, "SIGPWR") => signal,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::select! {
+            signal = recv_shutdown_signal(sigterm, "SIGTERM") => signal,
+            signal = recv_shutdown_signal(sigint, "SIGINT") => signal,
+        }
+    }
+}
+
+/// Awaits one successfully-installed signal handler, or waits forever if
+/// installation itself failed — letting [`wait_for_supervisor_shutdown_signal`]
+/// degrade to whichever subset of its signals it could actually register,
+/// rather than an all-or-nothing failure across every signal it cares about.
+#[cfg(unix)]
+async fn recv_shutdown_signal(
+    signal: std::io::Result<tokio::signal::unix::Signal>,
+    name: &'static str,
+) -> &'static str {
+    match signal {
+        Ok(mut signal) => {
+            let _ = signal.recv().await;
+            info!("Received {name}, shutting down supervisor process");
+            name
+        }
+        Err(_) => std::future::pending().await,
+    }
 }
 
 #[cfg(not(unix))]
@@ -631,6 +683,49 @@ mod tests {
             ssh_proxy_url_for_policy(&policy, Some([10, 200, 0, 1].into())).as_deref(),
             Some("http://10.200.0.1:8080")
         );
+    }
+
+    /// Regression test for a real gap found while implementing the LXD
+    /// driver (see `crates/openshell-driver-lxd`'s implementation plan):
+    /// `lxc restart` sends `SIGINT` to a container's PID 1, never
+    /// `SIGTERM`. Before this, `wait_for_supervisor_shutdown_signal` only
+    /// listened for `SIGTERM`, so this future would have hung forever
+    /// (relying on the kernel's default disposition to kill the process
+    /// out from under it, skipping this function's own graceful shutdown
+    /// signaling of the entrypoint child entirely).
+    #[tokio::test]
+    async fn wait_for_supervisor_shutdown_signal_reacts_to_sigint_not_just_sigterm() {
+        // `tokio::spawn`, not `tokio::pin!` -- an async fn's body (including
+        // the synchronous `signal()` handler-installation calls at its
+        // start) never runs until the future is actually polled at least
+        // once, and pinning alone doesn't poll it. Spawning gets it polled
+        // by the runtime; the sleep below is a margin on top of that, not
+        // a substitute for it.
+        let handle = tokio::spawn(wait_for_supervisor_shutdown_signal());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT).expect("raise(SIGINT) failed");
+
+        let signal = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("wait_for_supervisor_shutdown_signal did not resolve after SIGINT")
+            .expect("supervisor shutdown-signal task panicked");
+        assert_eq!(signal, "SIGINT");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_for_supervisor_shutdown_signal_reacts_to_sigpwr() {
+        // `lxc stop`'s clean-shutdown signal -- see this function's own
+        // doc comment. Linux-only: SIGPWR isn't defined on macOS/BSD.
+        let handle = tokio::spawn(wait_for_supervisor_shutdown_signal());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGPWR).expect("raise(SIGPWR) failed");
+
+        let signal = timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("wait_for_supervisor_shutdown_signal did not resolve after SIGPWR")
+            .expect("supervisor shutdown-signal task panicked");
+        assert_eq!(signal, "SIGPWR");
     }
 
     #[test]
