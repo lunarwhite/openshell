@@ -5,9 +5,9 @@
 > against a real LXD daemon.** The confinement spike (Step 0 below)
 > passed twice reproducibly; `cargo test -p openshell-driver-lxd --
 > --ignored` (the real-daemon `LxdClient` integration test) passes;
-> `crates/openshell-driver-lxd/spike/run-stage2.sh` (Phase 1, a
+> `crates/openshell-driver-lxd/hack/run-stage2.sh` (Phase 1, a
 > hand-prepared sandbox image) passes; and, as of 2026-08-09,
-> `crates/openshell-driver-lxd/spike/run-stage2-oci.sh` (Phase 2, the
+> `crates/openshell-driver-lxd/hack/run-stage2-oci.sh` (Phase 2, the
 > real, unmodified `ghcr.io/nvidia/openshell-community/sandboxes/
 > base:latest` image, pulled and converted by this crate's own
 > `src/image.rs` pipeline — no manual prep at all) **also passes**: a
@@ -26,24 +26,38 @@
 > all four tests (mTLS, resource limits, driver-config mounts,
 > rollback) — but that run's own output was not captured, unlike every
 > other real-run claim in this file, so treat it as reported rather than
-> independently verified here until a logged re-run exists. See "What's
-> actually implemented" below for both.
+> independently verified here until a logged re-run exists. **Also landed
+> since: expanded lifecycle/network-isolation/interrupted-delete unit test
+> coverage (Phase 2, Step 9); a real fix, found by a 2026-08-19 audit, for
+> the supervisor's LXD PID-1 signal contract** (`wait_for_supervisor_
+> shutdown_signal` now races `SIGTERM`/`SIGINT`/`SIGPWR` instead of only
+> `SIGTERM` — `lxc stop`/`lxc restart` never send `SIGTERM`); **and, from
+> rebasing this branch onto current `main` that same day, `StartSandbox`
+> plus no-op `EnsureWorkspace`/`DeleteWorkspace` RPCs** the `ComputeDriver`
+> trait grew upstream after this driver's original scaffolding. See "What's
+> actually implemented" below for all of it.
 
 LXD compute driver for OpenShell — Phase 1 scope: LXD/LXC on Ubuntu,
 container-type instances only, run as an unmanaged extension driver (zero
 changes to gateway core). See:
 
-- `.claude/plans/lxd-01-triage.md` — is this a real problem?
-- `.claude/plans/lxd-02-spike.md` — technical investigation
-- `.claude/plans/lxd-03-design-rfc.md` — design decisions and their rationale
-- `.claude/plans/lxd-04-implementation-plan.md` — the full phased plan this
-  crate implements Phase 1 of
+- `docs/01-triage.md` — is this a real problem?
+- `docs/02-spike.md` — technical investigation
+- `docs/03-design-rfc.md` — design decisions and their rationale
+- `docs/04-implementation-plan.md` — the full phased plan this crate
+  implements Phase 1 of
+- `docs/05-test-plan.md` — the staged, real-daemon validation procedure
+- `docs/06-lessons-learned.md` — a retrospective on the real bugs found
+  building and hardening this driver
+- `hack/` — the manual scripts that actually run that validation
+  procedure (WSL2, Multipass, or any other real Ubuntu/Linux host — see
+  its own README)
 
 ## Step 0 result: **PASS, anomalously — read the caveat before trusting this broadly**
 
-Run twice against a real daemon (`brawny-roadrunner`, a Multipass VM), on
-two slightly different kernel point releases (`7.0.0-28` then `7.0.0-29`),
-with the same result both times:
+Run twice against a real daemon on a Multipass VM, on two slightly
+different kernel point releases (`7.0.0-28` then `7.0.0-29`), with the
+same result both times:
 
 ```
 Nesting alone (security.nesting=true, unprivileged): PASS
@@ -82,8 +96,10 @@ Date: 2026-08-09
    it, though — re-run the spike to get an actual Landlock result rather
    than treating "the flag exists now" as equivalent to "it was checked."
 
-Full run artifacts: `.claude/plans/lxd-test-results/20260808T101714Z.md`
-and `.../20260809T004546Z.md`.
+Full run artifacts from both runs are not retained past this point in the
+branch's history — see `hack/README.md` for why results files are
+treated as ephemeral, and `hack/run-vm-tests.sh` to reproduce this
+result directly.
 
 If a future run's result is "needs `security.privileged=true`," **stop** —
 per the design doc, that's a stop-and-reconsider-the-whole-design outcome,
@@ -101,9 +117,18 @@ above, kept next to the code they justify.
 Built in parallel with the spike, per the implementation plan's explicit
 sequencing ("scaffolding is orthogonal to the spike's outcome"):
 
-- All seven `ComputeDriver` RPCs (`GetCapabilities`, `ValidateSandboxCreate`,
-  `CreateSandbox`, `GetSandbox`/`ListSandboxes`, `StopSandbox`,
-  `DeleteSandbox`, `WatchSandboxes`).
+- All seven `ComputeDriver` RPCs from Phase 1's original trait surface
+  (`GetCapabilities`, `ValidateSandboxCreate`, `CreateSandbox`,
+  `GetSandbox`/`ListSandboxes`, `StopSandbox`, `DeleteSandbox`,
+  `WatchSandboxes`), plus `GetGatewayListenerRequirements` (also there from
+  the start, mirroring the VM/Podman drivers' own gateway-callback-IP
+  resolution). Since a 2026-08-19 rebase onto current `main` grew the trait
+  by three more methods upstream, this driver also now implements
+  `StartSandbox` (mirrors `StopSandbox`'s shape, idempotent when already
+  running) and no-op `EnsureWorkspace`/`DeleteWorkspace` stubs — RFC 0011
+  Phase 3's namespace-per-workspace feature, meaningful only for the
+  Kubernetes driver's real namespaces; matches Podman/VM's identical no-op
+  treatment (`grpc.rs`).
 - A hand-rolled async LXD REST client over the Unix socket (`src/client.rs`)
   — no mature async Rust LXD client crate exists, matching the Podman
   driver's own precedent of hand-rolling rather than depending on one.
@@ -157,7 +182,7 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   fix, until a raw TCP probe from inside the entrypoint script (see
   above) succeeded while the supervisor's own gRPC call kept failing
   regardless — proving the network was never the (remaining) problem.
-- The entrypoint script's own diagnostic-output redirect (`build_entrypoint_script`) now uses a standalone `exec >/var/log/openshell-entrypoint.log 2>&1` rather than wrapping the network-setup commands in a `{ ...; } >file 2>&1` compound-command redirect. POSIX shell restores the original fds once a `{ ...; }` block's own redirect ends — so the previous version silently stopped redirecting output right before the script's final line, `exec {supervisor}`, which is exactly the one line whose output mattered most. Found the hard way running a real Stage 2 test: the supervisor successfully authenticated, fetched its policy, and stood up its proxy (`NET:LISTEN`) — then exited(1) for a still-unknown reason, and *every* captured log (the entrypoint log, `lxc info --show-log`, the gateway's own log) came up empty, because the exit happened after the point where output silently stopped being captured. `lxc info --show-log` itself was also misidentified as "the console log" in this driver's own diagnostics tooling — it's liblxc's internal trace log; the actual PID 1 console/tty ring buffer is `lxc console --show-log`, now captured separately by `run-stage2.sh` as defense in depth for failures that happen before the entrypoint script's redirect takes effect at all.
+- The entrypoint script's own diagnostic-output redirect (`build_entrypoint_script`) now uses a standalone `exec >/var/log/openshell-entrypoint.log 2>&1` rather than wrapping the network-setup commands in a `{ ...; } >file 2>&1` compound-command redirect, which silently stops redirecting once the block ends — see `docs/06-lessons-learned.md`'s fourth lesson for the POSIX-shell mechanism. Found the hard way running a real Stage 2 test: the supervisor successfully authenticated, fetched its policy, and stood up its proxy (`NET:LISTEN`) — then exited(1) for a still-unknown reason, and *every* captured log (the entrypoint log, `lxc info --show-log`, the gateway's own log) came up empty, because the exit happened after the point where output silently stopped being captured. `lxc info --show-log` was also misidentified as "the console log" in this driver's own diagnostics tooling (see `docs/06-lessons-learned.md`'s third lesson) — the actual PID 1 console/tty ring buffer is `lxc console --show-log`, now captured separately by `run-stage2.sh` as defense in depth for failures that happen before the entrypoint script's redirect takes effect at all.
 - Once that redirect was actually fixed, the real failure surfaced:
   `explicit process user 'sandbox' was not found in the image`. The
   supervisor's default policy (`process.run_as_user` unset,
@@ -178,57 +203,40 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   `ConnectSupervisor` handshake with the gateway (`supervisor session:
   accepted`) and a `Ready` phase transition all succeeded. It then failed
   spawning the sandbox's entrypoint child with a bare `Invalid argument
-  (os error 22)` and no other context anywhere in any captured log — and
-  stayed exactly that bare after two rounds of adding descriptive
-  `.map_err(...)` wrapping to every candidate fallible step in
-  `ProcessHandle::spawn_impl`'s `pre_exec` closure (`setns(CLONE_NEWNET)`,
-  then the seccomp filter installation), with the message text never
-  once changing. The actual explanation: `std::process::Command::
-  pre_exec`'s error-return channel can only carry a raw OS errno back to
-  the *parent* process across the fork boundary (it's a single integer
-  sent over a pipe) — an error constructed without one, which is what
-  every `io::Error::other(...)`/wrapped-miette-message in that whole
-  closure produces, has nothing transmissible, so libstd substitutes a
-  generic sentinel instead of the real message. No amount of adding
-  context to the *returned* error was ever going to surface anything
-  different; the message was being discarded by libstd itself, not by
-  our own code. The actual fix: write the diagnostic directly to fd 2
-  (`process::write_pre_exec_diagnostic`, a raw, async-signal-safe
-  `libc::write` — safe inside `pre_exec`) *before* returning, sidestepping
-  that channel entirely. This process's stderr is already redirected to
-  a real file by the sandbox's entrypoint script's own `exec >file 2>&1`
-  by the time any child is spawned, so the line lands somewhere readable
+  (os error 22)` that stayed byte-identical across two rounds of adding
+  `.map_err(...)` context to every candidate fallible step in
+  `ProcessHandle::spawn_impl`'s `pre_exec` closure — see
+  `docs/06-lessons-learned.md`'s second lesson for why enriching the
+  *returned* error could never have helped
+  (`std::process::Command::pre_exec`'s error channel can only carry a raw
+  OS errno across the fork boundary). The actual fix: write the
+  diagnostic directly to fd 2 (`process::write_pre_exec_diagnostic`, a
+  raw, async-signal-safe `libc::write`, safe inside `pre_exec`) *before*
+  returning, landing in the entrypoint script's own redirected log
   instead of vanishing into the fork/exec pipe protocol. Applied at every
   fallible step in both `process.rs`'s entrypoint-spawn closure and
-  `ssh.rs`'s equivalent SSH-exec closure. `run-stage2.sh` also now
-  captures the host VM's `dmesg` tail on any create/exec failure, as a
-  second, independent source (kernel-level, not process-level) in case
-  the failure is a BPF/seccomp verifier rejection.
+  `ssh.rs`'s equivalent SSH-exec closure; `run-stage2.sh` also now
+  captures the host VM's `dmesg` tail on any create/exec failure as a
+  second, kernel-level diagnostic source.
   **Resolved.** The very next real Stage 2 run's entrypoint log finally
   showed the real message: `pre_exec: drop_privileges_with_identity
   failed: EPERM: Operation not permitted`. Root cause: this crate's
   `SUPERVISOR_CAPABILITIES` list (`instance.rs`) was missing `setuid`,
-  `setgid`, `chown`, and `fowner`. Its doc comment claimed to mirror the
-  Podman driver's capability set "exactly," but only copied the Podman
-  README's "Capability Breakdown" table — the capabilities Podman's
-  driver *adds on top of* Podman's own container-runtime defaults. Podman
-  (like Docker) ships `SETUID`/`SETGID`/`CHOWN`/`FOWNER` in its default
-  capability set already; that driver only has to avoid *dropping* them,
-  never has to list them. LXD's `raw.lxc: lxc.cap.keep` has no "defaults
-  plus additions" concept at all — it's an **exhaustive** allowlist, and
-  everything not named is dropped, including capabilities a container
-  would otherwise carry by default. The omission compiled cleanly and
-  passed every unit test (including one asserting this same, incomplete
-  list's own members are present in the generated config — a
-  self-referential check that could never catch a *missing* entry) right
-  up until a real Stage 2 run finally exercised `drop_privileges()` for
-  the first time. Fixed by adding all four capabilities to the list.
-  **With this fix, the very next Stage 2 run passed the full lifecycle
-  end to end**: `sandbox create` (entrypoint spawned, privileges
-  dropped, Landlock `restrict_self()` + seccomp enforced, workload ran),
-  `sandbox exec` (a second, independent SSH-relayed command), and
-  `sandbox delete`, all through the real driver/gateway/CLI stack
-  against a real LXD daemon.
+  `setgid`, `chown`, and `fowner` — see `docs/06-lessons-learned.md`'s
+  headline lesson for the full account of why (LXD's `raw.lxc: lxc.cap.keep`
+  is an **exhaustive** allowlist, not Docker/Podman's additive one, and
+  this list only ever copied the Podman README's *additions* table). The
+  omission compiled cleanly and passed every unit test — including one
+  asserting this same, incomplete list's own members are present in the
+  generated config, a self-referential check that could never catch a
+  *missing* entry — right up until a real Stage 2 run finally exercised
+  `drop_privileges()` for the first time. Fixed by adding all four
+  capabilities to the list. **With this fix, the very next Stage 2 run
+  passed the full lifecycle end to end**: `sandbox create` (entrypoint
+  spawned, privileges dropped, Landlock `restrict_self()` + seccomp
+  enforced, workload ran), `sandbox exec` (a second, independent
+  SSH-relayed command), and `sandbox delete`, all through the real
+  driver/gateway/CLI stack against a real LXD daemon.
 - **Phase 2, Step 1: the OCI-to-LXD image conversion pipeline**
   (`src/image.rs`) — real registry pull via `oci-client` (pure Rust, the
   same crate/version `openshell-driver-vm` already uses; no `skopeo`/
@@ -269,12 +277,11 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   Images" section) — so LXD is the odd one out for `WorkingDir`, matching
   Podman's behavior by accident of never having built the translation,
   not by a considered design choice the way Podman's own fixed-workspace
-  convention is. `User`, unlike `WorkingDir`, was already correctly
-  disclosed as an accepted LXD-specific gap in
-  `docs/reference/sandbox-compute-drivers.mdx`'s "Sandbox User Identity"
-  → "LXD Driver" subsection — this bullet just didn't cross-reference it
-  before now. Neither gap is fixed here; both are now at least accurately
-  described instead of overstated.
+  convention is. Both `User` and `WorkingDir` are disclosed as accepted
+  LXD-specific gaps in `docs/reference/sandbox-compute-drivers.mdx`'s
+  "Sandbox User Identity" → "LXD Driver" subsection — this bullet just
+  didn't cross-reference either before now. Neither gap is fixed here;
+  both are now at least accurately described instead of overstated.
   **First real run against ghcr.io and a real LXD daemon failed with
   `No space left on device` while packaging the converted image.** Root
   cause was a genuine design flaw, not the VM's disk alone: the pipeline
@@ -372,43 +379,37 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   already guarantees) instead of letting the real `exec` redirect be the
   first thing to fail.
 - **That fix's first version was itself broken by a subtle POSIX shell
-  rule** — it probed writability with `: >"$ENTRYPOINT_LOG" 2>/dev/null`.
-  `:` is a POSIX *special* builtin, and POSIX mandates that a
-  redirection error on a special builtin exits the shell immediately,
-  `if` guard or not — a rule that does not apply to ordinary commands.
-  Confirmed directly against `dash` (Ubuntu's real `/bin/sh`, and thus
-  what actually runs this script as PID 1): the fallback branch was
-  never reached, dash exited right there with the identical
-  externally-visible symptom (PID 1 dying before the supervisor ever
-  started) the fallback was written to fix in the first place — same
-  crash, one line later, same real Stage 2 VM run needed to surface it.
-  `sh -n` (syntax-only, never executes anything) can't catch a runtime
-  rule like this, and the fallback's own *string-content* unit test
-  couldn't either (it checks what the generated script says, not how a
-  real shell executes it). Fixed by using `true` (an ordinary builtin)
-  instead of `:`, and by reordering the redirects (`2>/dev/null` before
-  the write attempt, not after) so dash's own diagnostic for the failing
-  redirect — which it emits independently of the command's own stderr —
-  is actually suppressed.   Added a genuine runtime regression test that
-  runs the generated script under `dash` specifically (not whatever `sh`
-  resolves to on the test host — confirmed macOS's default `/bin/sh`
-  does *not* reproduce this special-builtin behavior, so a test using
-  generic `sh` would have passed either way) against a real unwritable
-  `/var/log` (true for an unprivileged test-runner user on both Linux
-  and macOS, no mocking needed) and asserts the fallback log actually
-  gets written.
+  rule** — it probed writability with `: >"$ENTRYPOINT_LOG" 2>/dev/null`,
+  and `:` is one of the POSIX *special* builtins for which a redirection
+  error exits the shell immediately, `if` guard or not (ordinary
+  commands, including `true`, don't have this behavior) — see
+  `docs/06-lessons-learned.md`'s seventh lesson for the full POSIX rule
+  and why this specifically needed a real `dash` run to catch (`sh -n`
+  and the fallback's own string-content unit test both miss it; macOS's
+  default `/bin/sh` doesn't enforce the rule either, so local
+  smoke-testing gave a false pass). Confirmed directly against `dash`
+  (Ubuntu's real `/bin/sh`, and thus what actually runs this script as
+  PID 1): the fallback branch was never reached, dash exited right there
+  with the identical externally-visible symptom (PID 1 dying before the
+  supervisor ever started) the fallback was written to fix in the first
+  place — same crash, one line later, same real Stage 2 VM run needed to
+  surface it. Fixed by using `true` instead of `:`, and by reordering the
+  redirects (`2>/dev/null` before the write attempt, not after) so
+  dash's own diagnostic for the failing redirect is actually suppressed.
+  Added a genuine runtime regression test that runs the generated script
+  under `dash` specifically against a real unwritable `/var/log` and
+  asserts the fallback log actually gets written.
 - **The image conversion pipeline silently drops every layer's declared
   file ownership when the driver process itself runs as a non-root
   user** (the common case — nothing about this pipeline requires root).
-  Confirmed directly against the real `tar` crate version this crate
-  depends on: a directory declared `uid=0`/`gid=0` in a tar header
-  extracts, as a non-root process, owned by the *extracting* process's
-  own UID instead — not a `tar`-crate bug to work around, just the basic
-  Unix rule that `chown` to a UID other than the caller's own requires
-  root or `CAP_CHOWN`. This had already caused the `/var/log` failure
-  above, just invisibly — the actual fix there (fall back to `/tmp`)
-  sidestepped needing to know the *why*. It stopped being invisible when
-  a real sandbox image's supervisor called `mkdir /run/netns` (root-owned
+  See `docs/06-lessons-learned.md`'s sixth lesson for the full diagnosis
+  and reproduction — a basic Unix rule, not a `tar`-crate bug: `chown` to
+  a UID other than the caller's own requires root or `CAP_CHOWN`, so a
+  tar entry declaring `uid=0` silently extracts owned by the extracting
+  process instead. This had already caused the `/var/log` failure above,
+  just invisibly — the fix there (fall back to `/tmp`) sidestepped
+  needing to know the *why*. It stopped being invisible when a real
+  sandbox image's supervisor called `mkdir /run/netns` (root-owned
   `/run`, mode 0755, so ownership actually matters — unlike `/tmp`'s
   world-writable bits) and got `EACCES`, indistinguishable at the call
   site from a genuine missing-capability error. Fixed by never relying
@@ -445,9 +446,9 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   rollback/reconciliation hardening.** Unit-test-verified directly; the
   real-daemon path has a more qualified status than every other claim in
   this file. Two logged `run-feature-parity.sh` runs against a real
-  daemon (`.claude/plans/lxd-test-results/feature-parity-
-  20260809T172551Z.md`, `...-20260809T174249Z.md`) each passed mTLS,
-  mounts, and rollback but failed resource limits specifically — Test B
+  daemon (raw logs not retained past this point in the branch's history)
+  each passed mTLS, mounts, and rollback but failed resource limits
+  specifically — Test B
   couldn't read `/sys/fs/cgroup/cpu.max`/`memory.max` via `sandbox exec`
   because the sandbox's own Landlock policy blocks that path from
   *inside* the sandbox (fixed in the script by reading cgroup files via
@@ -574,7 +575,7 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   initial-sync events. This is the same contract the Podman driver
   documents (`crates/openshell-driver-podman/src/watcher.rs`) — verified by
   reading its actual implementation while building this, not assumed.
-- Unit tests (45, all passing) including stub-server integration tests
+- Unit tests (115, all passing) including stub-server integration tests
   (`src/test_utils.rs`, mirroring Podman's pattern) that exercise the real
   HTTP/envelope-resolution code path without a real LXD daemon.
 - One additional real-daemon integration test,
@@ -589,7 +590,7 @@ sequencing ("scaffolding is orthogonal to the spike's outcome"):
   meaning to the raw REST API) to a local alias via `lxc image copy` first
   — the REST API has no concept of that shorthand, unlike `lxc launch`. Run
   it explicitly with `cargo test -p openshell-driver-lxd -- --ignored`. See
-  `.claude/plans/lxd-05-test-plan.md` (Stage 1).
+  `docs/05-test-plan.md` (Stage 1).
 
 ## What the Stage 2 pass does NOT prove
 
@@ -617,11 +618,14 @@ for the authoritative list, summarized here:
 
 ## What's explicitly NOT implemented (by design, Phase 2 or later)
 
-- General OCI image resolution. Set `default_image` to one LXD image alias
-  or fingerprint you convert by hand once
-  (`umoci unpack` + `lxc image import`); every sandbox uses that same
-  image. The OCI-to-LXD conversion pipeline is Phase 2's largest single
-  workstream — see the design doc.
+**General OCI image resolution is no longer on this list** — Phase 2, Step 1
+built it (`src/image.rs`, see "What's actually implemented" above); a
+sandbox with its own `spec.template.image` no longer needs a hand-converted
+`default_image`. What remains unverified about that pipeline (multi-arch,
+concurrent conversions of different digests, the broader image corpus) is a
+coverage gap, not a by-design omission — see "What the Stage 2 pass does
+NOT prove" above and the Phase 2 Step 1 bullet's own account.
+
 - Auto-detection. This driver is never added to the gateway's
   `detect_driver()` — it's opt-in only, like the VM driver, because LXD has
   no rootless mode and `lxd`-group membership is host-root-equivalent. See
@@ -634,9 +638,10 @@ for the authoritative list, summarized here:
   the full account of what's parsed vs. actually used). `WorkingDir`
   parity would mean matching Docker's `resolve_oci_workspace_root`;
   `User` parity would mean matching Docker/Podman's OCI `USER` inspection
-  for dynamic UID/GID resolution (already tracked as a known gap in
-  `docs/reference/sandbox-compute-drivers.mdx`'s "Sandbox User Identity"
-  section). **A real trap for whoever builds `WorkingDir` parity next**:
+  for dynamic UID/GID resolution. Both are already tracked as known LXD
+  gaps in `docs/reference/sandbox-compute-drivers.mdx`'s "Sandbox User
+  Identity" → "LXD Driver" section. **A real trap for whoever builds
+  `WorkingDir` parity next**:
   Docker passes the resolved workspace root as its own array element in
   the container's `Cmd` (`cmd: vec!["--workdir".into(), workspace_root]`)
   — never shell-interpreted, since Docker's `Cmd` execs directly, no
@@ -662,7 +667,11 @@ for the authoritative list, summarized here:
 ## Running it
 
 ```shell
-# 1. Convert one sandbox image by hand (outside this driver):
+# 1. Optional: pre-convert one sandbox image by hand as a pinned fallback
+#    for sandboxes that don't specify their own image. Skip this entirely
+#    if every sandbox brings its own `spec.template.image` -- Phase 2's
+#    OCI-to-LXD pipeline (`src/image.rs`) converts that automatically, no
+#    manual step needed (see "What's actually implemented" above).
 #    umoci unpack --rootless <oci-image> <bundle-dir>
 #    <package bundle-dir into LXD's metadata.yaml + squashfs shape>
 #    lxc image import <path> --alias openshell-sandbox-base
@@ -691,15 +700,23 @@ openshell-gateway --drivers lxd --compute-driver-socket /run/openshell/lxd-drive
 
 ## Development notes
 
-- Built and unit-tested on macOS (no LXD available) — the
-  `#[cfg(target_os = "linux")]` branch in `driver.rs`'s
-  `gateway_listener_requirements` (which reads the LXD bridge's gateway IP
-  back from network state) is dead code on this platform by construction;
-  `cargo clippy` reports a handful of matching dead-code warnings on
-  non-Linux targets. LXD itself only runs on Linux, so this is expected and
-  harmless — those warnings disappear on a real Linux build.
+- Built and unit-tested on macOS (no LXD available). Re-verified directly
+  (`cargo clippy -p openshell-driver-lxd --all-targets`, 2026-08-22): only
+  3 of the warnings clippy reports here are true non-Linux artifacts —
+  `NetworkState`, `NetworkAddress`, and `LxdClient::get_network_state` are
+  only ever constructed/called from the `#[cfg(target_os = "linux")]`
+  branch in `driver.rs`'s `gateway_listener_requirements` (which reads the
+  LXD bridge's gateway IP back from network state), so those three
+  disappear on a real Linux build. The remaining ones on this platform
+  (`OperationResult::status_code`, `Instance::last_used_at`,
+  `ImageAliasInfo::name`, `status_code::STARTING`,
+  `ConvertedImage::fingerprint` — all kept for API-shape completeness /
+  lossless `Debug` dumps of LXD REST responses, not platform-gated; plus
+  two `clippy::similar_names` and one `unsafe_code` warning in
+  `image.rs`'s test helpers) are genuinely unused dead code that would
+  also warn on Linux, not a portability artifact — not yet cleaned up.
 - `cargo test -p openshell-driver-lxd` requires binding Unix sockets under
-  `/tmp` for the stub-server tests; some sandboxed shells (including the
-  one used to build this crate) restrict that and need elevated
-  permissions to run those specific tests. `cargo check`/`clippy`/the other
-  29 tests are unaffected.
+  `/tmp` for the 16 stub-server tests that use `test_utils::spawn_lxd_stub`;
+  some sandboxed shells restrict that and need elevated permissions to run
+  those specific tests. `cargo check`/`clippy`/the other 99 tests are
+  unaffected (counts confirmed against a direct 115-test run, 2026-08-22).
