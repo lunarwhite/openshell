@@ -39,7 +39,7 @@ pub use compose::{
 };
 pub use l7_validate::{
     L7EndpointFields, L7Protocol, agent_authored_transport_rejection,
-    validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+    validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics, validate_tls_mode,
 };
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning,
@@ -1363,6 +1363,12 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// `tls` has a value outside the supported set.
+    UnknownTlsMode {
+        policy_name: String,
+        host: String,
+        value: String,
+    },
     /// An endpoint contains a deterministic L7 semantic error.
     InvalidL7Endpoint {
         policy_name: String,
@@ -1525,6 +1531,18 @@ impl fmt::Display for PolicyViolation {
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
+            Self::UnknownTlsMode {
+                policy_name,
+                host,
+                value,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has unsupported \
+                     tls value '{value}'; {}",
+                    l7_validate::TLS_MODE_REMEDIATION
+                )
+            }
             Self::InvalidL7Endpoint {
                 policy_name,
                 endpoint_index,
@@ -1638,6 +1656,7 @@ impl fmt::Display for PolicyViolation {
 /// - MCP endpoints must carry a nonempty, unique allowlist of exact supported
 ///   revisions
 /// - Non-MCP endpoints must not carry MCP options
+/// - Endpoint `tls` must be omitted or `skip`
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
@@ -1824,6 +1843,13 @@ fn validate_sandbox_policy_with_mcp_presence(
                 violations.push(PolicyViolation::CredentialSigningWithBodyRewrite {
                     policy_name: name.clone(),
                     host: ep.host.clone(),
+                });
+            }
+            if validate_tls_mode(&ep.tls).is_some() {
+                violations.push(PolicyViolation::UnknownTlsMode {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                    value: ep.tls.clone(),
                 });
             }
 
@@ -4129,6 +4155,38 @@ network_policies:
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    fn policy_with_endpoint_tls(tls: &str) -> SandboxPolicy {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: tls.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn validate_rejects_unknown_tls_mode() {
+        for tls in ["terminate", "passthrough", "TERMINATE", "bogus"] {
+            let violations = validate_sandbox_policy(&policy_with_endpoint_tls(tls))
+                .expect_err("unsupported tls value must be rejected");
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::UnknownTlsMode { .. })),
+                "tls: {tls} should be rejected: {violations:?}"
+            );
+        }
     }
 
     #[test]

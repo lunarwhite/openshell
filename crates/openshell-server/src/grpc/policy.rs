@@ -7464,6 +7464,24 @@ mod tests {
         })
     }
 
+    fn policy_with_endpoint_tls(tls: &str) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "api".to_string(),
+            NetworkPolicyRule {
+                name: "api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    tls: tls.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
     fn mcp_policy_with_versions(versions: &[&str]) -> ProtoSandboxPolicy {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.network_policies.insert(
@@ -7669,6 +7687,7 @@ mod tests {
                 mcp_policy_with_versions(&["2025-11-25", "2025-11-25"]),
             ),
             ("unsupported", mcp_policy_with_versions(&["latest"])),
+            ("legacy-tls", policy_with_endpoint_tls("terminate")),
         ];
 
         for (case, policy) in cases {
@@ -9629,7 +9648,6 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = "terminate".to_string();
         endpoint.access = "full".to_string();
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
@@ -11598,7 +11616,6 @@ mod tests {
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
         bound_endpoint.access = "full".to_string();
-        bound_endpoint.tls = "terminate".to_string();
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store

@@ -201,11 +201,14 @@ Is L7 inspection needed?
 
 | API host port | TLS setting |
 |--------------|-------------|
-| Port 443 (HTTPS) and L7 rules/preset needed | `tls: terminate` (required for inspection) |
-| Port 443 (HTTPS) and L4-only | Omit `tls` (passthrough, no L7); choose omitted protocol or explicit TCP based on client/runtime as above |
+| Port 443 (HTTPS) and L7 rules/preset needed | Omit `tls` — the proxy auto-detects TLS and terminates it for inspection |
+| Port 443 (HTTPS) and L4-only | Omit `tls`; choose omitted protocol or explicit TCP based on client/runtime as above |
 | Non-443 (HTTP) | Omit `tls` |
+| Upstream requires client-certificate mTLS or a non-HTTP protocol | `tls: skip` (disables inspection and credential injection) |
 
-**Critical**: `protocol: rest` on port 443 without `tls: terminate` will not work — the proxy cannot inspect encrypted traffic. Always set `tls: terminate` when combining port 443 with L7 rules.
+**Critical**: omit `tls` for every inspected endpoint. `skip` is the only accepted non-empty value; write it lowercase, because the proxy only honors that spelling. Any other value — including the removed `terminate` and `passthrough` spellings — fails policy validation. The gateway rejects such a policy outright; a rejected policy read from disk falls back to the restrictive default, which denies all network access.
+
+Do not "fix" a rejected `tls` value by changing it to `skip`. Remove the field instead. `skip` stops inspection, credential injection, and L7 rule enforcement for that endpoint, so it silently widens what the endpoint allows.
 
 ### Middleware Decision
 
@@ -269,7 +272,6 @@ network_policies:
       - host: <api_host>
         port: <port>
         protocol: rest          # Required for L7 inspection
-        tls: terminate          # Required for HTTPS + L7
         enforcement: enforce    # or audit
         # Use ONE of: access OR rules (never both)
         access: <preset>        # read-only | read-write | full
@@ -373,7 +375,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
       `protocol: tcp` is L4-only and must not contain either field
 - [ ] Every `protocol: tcp` endpoint has a valid DNS hostname; it is not
       hostless, an IP literal, a trailing-dot name, or a malformed DNS selector
-- [ ] If `tls: terminate` is set, `protocol` is also set
+- [ ] `tls` is either omitted or set to `skip`; no other value is accepted
 - [ ] `rules` list is not empty when present
 - [ ] If `protocol: sql`, `enforcement` is not `enforce`
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
@@ -384,7 +386,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 
 ### Schema Warnings (log-only, but should be fixed)
 
-- [ ] `protocol: rest` on port 443 should have `tls: terminate`
+- [ ] `tls: skip` is not combined with L7 rules on port 443; inspection cannot work on encrypted traffic
 - [ ] HTTP methods are standard: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, or `*`
 - [ ] Credentialed destinations are also covered by the attached provider
       profile endpoint; policy admission alone does not authorize credential
@@ -551,7 +553,6 @@ my_api_readonly:
     - host: api.example.com
       port: 443
       protocol: rest
-      tls: terminate
       enforcement: enforce
       access: read-only
   binaries:
@@ -567,7 +568,6 @@ my_api_custom:
     - host: api.example.com
       port: 443
       protocol: rest
-      tls: terminate
       enforcement: enforce
       rules:
         - allow:

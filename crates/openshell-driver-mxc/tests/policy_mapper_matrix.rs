@@ -452,19 +452,19 @@ fn b_tls_skip_warning() {
     assert_single_loss(&r.loss, ".tls", "warning", "endpoint.tls=skip");
 }
 
-/// endpoint.tls = "full" (any non-skip) → "error".
+/// endpoint.tls = a miscased `skip` → "error"; the mapper compares literally.
 #[test]
 fn b_tls_non_skip_error() {
     let policy = net_policy(
         "r",
         NetworkEndpoint {
             host: "api.example.com".into(),
-            tls: "terminate".into(),
+            tls: "SKIP".into(),
             ..Default::default()
         },
     );
     let r = map_to_mxc(&policy, &bubblewrap_opts());
-    assert_single_loss(&r.loss, ".tls", "error", "endpoint.tls=terminate");
+    assert_single_loss(&r.loss, ".tls", "error", "endpoint.tls=SKIP");
 }
 
 /// endpoint.enforcement = "audit" → "error".

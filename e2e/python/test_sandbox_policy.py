@@ -887,20 +887,21 @@ def test_ssrf_loopback_blocked_even_with_allowed_ips(
 
 
 # =============================================================================
-# L7 Tests -- TLS termination HTTPS inspection (Phase 2: tls=terminate)
+# L7 Tests -- TLS termination HTTPS inspection
 #
 # These tests use api.anthropic.com:443 as a real HTTPS endpoint since the
 # sandbox already has proxy connectivity. The ephemeral CA is trusted via
-# SSL_CERT_FILE injected into the sandbox environment.
+# SSL_CERT_FILE injected into the sandbox environment. TLS termination is
+# automatic, so no endpoint sets the tls field.
 #
-# L7-T1: TLS terminate + access=full allows HTTPS requests through
-# L7-T2: TLS terminate + access=read-only denies HTTPS POST (enforce)
-# L7-T3: TLS terminate + enforcement=audit logs but allows HTTPS POST
-# L7-T4: TLS terminate with explicit path rules
+# L7-T1: access=full allows HTTPS requests through
+# L7-T2: access=read-only denies HTTPS POST (enforce)
+# L7-T3: enforcement=audit logs but allows HTTPS POST
+# L7-T4: explicit path rules over terminated TLS
 # L7-T5: CA trust store is injected (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS)
 # L7-T6: L7 deny response is valid JSON with expected fields
 # L7-T7: L7 request logging includes structured fields
-# L7-T8: Port 443 + protocol=rest without tls=terminate warns (L7 not evaluated)
+# L7-T8: Port 443 + protocol=rest is inspected without an explicit tls field
 # L7-T9: Query matcher glob/any allows and denies as expected
 # L7-T10: Rule without query matcher allows any query params
 # =============================================================================
@@ -909,7 +910,7 @@ def test_ssrf_loopback_blocked_even_with_allowed_ips(
 def test_l7_tls_full_access_allows_all(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """L7-T1: TLS terminate + access=full allows HTTPS GET through."""
+    """L7-T1: access=full allows HTTPS GET through terminated TLS."""
     policy = _base_policy(
         network_policies={
             "anthropic": sandbox_pb2.NetworkPolicyRule(
@@ -919,7 +920,6 @@ def test_l7_tls_full_access_allows_all(
                         host="api.anthropic.com",
                         port=443,
                         protocol="rest",
-                        tls="terminate",
                         enforcement="enforce",
                         access="full",
                     ),
@@ -945,7 +945,7 @@ def test_l7_tls_full_access_allows_all(
 def test_l7_tls_read_only_denies_post(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """L7-T2: TLS terminate + access=read-only denies HTTPS POST (enforce)."""
+    """L7-T2: access=read-only denies HTTPS POST (enforce)."""
     policy = _base_policy(
         network_policies={
             "anthropic": sandbox_pb2.NetworkPolicyRule(
@@ -955,7 +955,6 @@ def test_l7_tls_read_only_denies_post(
                         host="api.anthropic.com",
                         port=443,
                         protocol="rest",
-                        tls="terminate",
                         enforcement="enforce",
                         access="read-only",
                     ),
@@ -989,7 +988,7 @@ def test_l7_tls_read_only_denies_post(
 def test_l7_tls_audit_mode_allows_but_logs(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """L7-T3: TLS terminate + enforcement=audit logs but allows HTTPS POST."""
+    """L7-T3: enforcement=audit logs but allows HTTPS POST."""
     policy = _base_policy(
         network_policies={
             "anthropic": sandbox_pb2.NetworkPolicyRule(
@@ -999,7 +998,6 @@ def test_l7_tls_audit_mode_allows_but_logs(
                         host="api.anthropic.com",
                         port=443,
                         protocol="rest",
-                        tls="terminate",
                         enforcement="audit",
                         access="read-only",
                     ),
@@ -1032,7 +1030,7 @@ def test_l7_tls_audit_mode_allows_but_logs(
 def test_l7_tls_explicit_path_rules(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """L7-T4: TLS terminate with explicit path rules."""
+    """L7-T4: explicit path rules apply over terminated TLS."""
     policy = _base_policy(
         network_policies={
             "anthropic": sandbox_pb2.NetworkPolicyRule(
@@ -1042,7 +1040,6 @@ def test_l7_tls_explicit_path_rules(
                         host="api.anthropic.com",
                         port=443,
                         protocol="rest",
-                        tls="terminate",
                         enforcement="enforce",
                         rules=[
                             sandbox_pb2.L7Rule(
@@ -1140,7 +1137,6 @@ def test_l7_tls_deny_response_format(
                         host="api.anthropic.com",
                         port=443,
                         protocol="rest",
-                        tls="terminate",
                         enforcement="enforce",
                         access="read-only",
                     ),
@@ -1184,7 +1180,6 @@ def test_l7_tls_log_fields(
                         host="api.anthropic.com",
                         port=443,
                         protocol="rest",
-                        tls="terminate",
                         enforcement="enforce",
                         access="full",
                     ),

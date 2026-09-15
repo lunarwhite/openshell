@@ -121,7 +121,7 @@
 - OPA two-action model: Allow, Deny (NetworkAction in opa.rs). InspectForInference was REMOVED.
 - Rego network_action rule: "allow" or "deny" only (no "inspect_for_inference")
 - Behavioral trigger: endpoint `protocol` field -> L7 inspection; absent -> L4 raw copy_bidirectional
-- Behavioral trigger: `tls: terminate` -> MITM TLS with ephemeral CA; requires `protocol` to also be set
+- Behavioral trigger: omitted `tls` -> auto-detect ClientHello, MITM TLS with ephemeral CA; `tls: skip` opts out
 - Behavioral trigger: `enforcement: enforce` -> deny at proxy; `audit` (default) -> log + forward
 - Access presets: read-only (GET/HEAD/OPTIONS), read-write (+POST/PUT/PATCH), full (*/*)
 - Validation: rules+access mutual exclusion, protocol requires rules/access, sql+enforce blocked, empty rules rejected

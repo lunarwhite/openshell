@@ -2629,6 +2629,15 @@ pub fn validate_profile_set(
                 }
             }
 
+            if let Some(reason) = openshell_policy::validate_tls_mode(&endpoint.tls) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].tls"),
+                    reason,
+                ));
+            }
+
             if profile.has_credentialed_endpoints()
                 && !endpoint.allow_uninspected_credentials
                 && (endpoint.protocol.trim().is_empty()
@@ -3261,6 +3270,34 @@ mod tests {
             .iter()
             .find(|profile| profile.id == id)
             .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+    }
+
+    #[test]
+    fn profile_lint_rejects_unsupported_tls_value() {
+        let profile = parse_profile_yaml(
+            r"
+id: legacy-tls
+display_name: Legacy TLS
+category: other
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-only
+    tls: terminate
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("legacy.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "endpoints[0].tls"
+                    && diagnostic
+                        .message
+                        .contains("unsupported tls value 'terminate'")
+            }),
+            "expected a tls diagnostic: {diagnostics:?}"
+        );
     }
 
     #[test]
@@ -5119,7 +5156,6 @@ endpoints:
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
-    tls: terminate
     enforcement: enforce
     rules:
       - allow:
@@ -5163,7 +5199,7 @@ binaries:
         let rest_ep = &proto.endpoints[1];
         assert_eq!(rest_ep.port, 0);
         assert_eq!(rest_ep.ports, vec![443, 8443]);
-        assert_eq!(rest_ep.tls, "terminate");
+        assert_eq!(rest_ep.tls, "");
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
         assert!(rest_ep.allow_uninspected_credentials);

@@ -49,6 +49,26 @@ pub fn is_explicit_tcp_protocol(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("tcp")
 }
 
+/// Remediation shared by every `tls` rejection path. Removing the field
+/// preserves behavior; `skip` is a posture downgrade, not an equivalent fix.
+pub const TLS_MODE_REMEDIATION: &str = "remove the tls field to keep automatic TLS termination. Set 'tls: skip' only to deliberately stop inspecting this endpoint, which also disables credential injection and L7 rule enforcement for it";
+
+/// Reject `tls` values outside the supported set.
+///
+/// Omitted means auto-detect and terminate for inspection; `skip` opts out.
+/// The comparison is case-insensitive because consumers match `skip` literally,
+/// so a miscased value is inspected — accepting it keeps the pre-0.1.0 behavior
+/// rather than adding a second breaking change.
+pub fn validate_tls_mode(tls: &str) -> Option<String> {
+    if tls.is_empty() || tls.eq_ignore_ascii_case("skip") {
+        return None;
+    }
+
+    Some(format!(
+        "unsupported tls value '{tls}'; {TLS_MODE_REMEDIATION}"
+    ))
+}
+
 /// Reject transport choices that an in-sandbox agent must not grant itself.
 ///
 /// An omitted protocol remains allowed: it uses the established explicit
@@ -101,9 +121,30 @@ mod agent_transport_tests {
     #[test]
     fn agent_cannot_request_native_tcp_or_skip_tls_inspection() {
         assert!(agent_authored_transport_rejection("tcp", "").is_some());
-        assert!(agent_authored_transport_rejection("TCP", "terminate").is_some());
+        assert!(agent_authored_transport_rejection("TCP", "").is_some());
         assert!(agent_authored_transport_rejection("", "skip").is_some());
         assert!(agent_authored_transport_rejection("rest", "SKIP").is_some());
+    }
+}
+
+#[cfg(test)]
+mod tls_mode_tests {
+    use super::validate_tls_mode;
+
+    #[test]
+    fn omitted_and_skip_are_accepted_in_any_case() {
+        for tls in ["", "skip", "SKIP", "Skip"] {
+            assert_eq!(validate_tls_mode(tls), None, "tls: {tls:?}");
+        }
+    }
+
+    #[test]
+    fn every_other_value_is_rejected() {
+        for tls in ["terminate", "passthrough", "TERMINATE", "bogus"] {
+            let error = validate_tls_mode(tls).expect("must be rejected");
+            assert!(error.contains(&format!("unsupported tls value '{tls}'")));
+            assert!(error.contains("remove the tls field"));
+        }
     }
 }
 

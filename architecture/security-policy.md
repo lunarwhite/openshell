@@ -104,6 +104,12 @@ stream, but it does not inspect TLS SNI, HTTP `Host`, or another protocol-level
 destination. Compatible shared infrastructure can therefore let a client
 select another tenant, virtual host, or service behind the approved front door.
 
+An endpoint's `tls` field is either omitted, meaning auto-detect and terminate
+for inspection, or `skip`. Every other value fails validation at the gateway
+create path, at provider profile lint, at agent-authored proposal ingestion, and
+at sandbox policy load, so a policy cannot claim a transport behavior the proxy
+does not honor.
+
 ## Credentialed Endpoints
 
 OpenShell keeps provider credentials on paths it can inspect or rewrite by
